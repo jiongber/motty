@@ -533,6 +533,16 @@ func TestParseComposeReadsTheJSONListing(t *testing.T) {
 	}
 }
 
+func TestComposeProjectSplitsItsConfigFiles(t *testing.T) {
+	project := ComposeProject{ConfigFiles: "/srv/web/compose.yml, /srv/web/override.yml,, "}
+	if files := project.ConfigFileList(); len(files) != 2 || files[0] != "/srv/web/compose.yml" || files[1] != "/srv/web/override.yml" {
+		t.Fatalf("files %q", files)
+	}
+	if files := (ComposeProject{}).ConfigFileList(); len(files) != 0 {
+		t.Fatalf("no files: %q", files)
+	}
+}
+
 func TestComposeNeedsThePluginAndActionsRefuseUnsafeNames(t *testing.T) {
 	runner := &fixedRunner{output: "docker: 'compose' is not a docker command.\nSee 'docker --help'", err: errors.New("exit status 1")}
 	if _, err := Compose(context.Background(), runner); !errors.Is(err, ErrNoCompose) {

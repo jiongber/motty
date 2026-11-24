@@ -822,6 +822,7 @@ type ToolsMessages struct {
 	RemoteTabNetworks               string
 	RemoteTabCompose                string
 	RemoteColConfig                 string
+	RemoteConfigEditHint            string
 	RemoteEmptyCompose              string
 	RemoteConfirmDownTitle          string
 	RemoteConfirmDownFmt            string

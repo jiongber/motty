@@ -5,12 +5,14 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/vivaui/viva/app"
 	"github.com/vivaui/viva/gfx"
 	"motty/internal/remotetools"
 	"motty/internal/sshconn"
@@ -233,6 +235,14 @@ func (server *remoteServer) setContainers(fixture string) {
 
 func openRemoteToolsDialog(t *testing.T) (*State, *remoteServer, *fakeShell) {
 	t.Helper()
+	state, server, _, shell := openRemoteToolsDialogConn(t)
+	return state, server, shell
+}
+
+// openRemoteToolsDialogConn is openRemoteToolsDialog keeping the connection so
+// a test can back it with a file server as well as the command runner.
+func openRemoteToolsDialogConn(t *testing.T) (*State, *remoteServer, *fakeConn, *fakeShell) {
+	t.Helper()
 	state, _, fake, shell := liveSession(t)
 	server := &remoteServer{failures: map[string]error{}}
 	fake.runCommand = server.run
@@ -247,7 +257,7 @@ func openRemoteToolsDialog(t *testing.T) (*State, *remoteServer, *fakeShell) {
 		t.Fatalf("the dialog did not open: modal %d", state.modal)
 	}
 	waitFor(t, state, func() bool { return !state.remote.loading })
-	return state, server, shell
+	return state, server, fake, shell
 }
 
 func TestRemoteToolsListProcessesOnceAndNeverPoll(t *testing.T) {
@@ -736,6 +746,65 @@ func TestRemoteToolsManageComposeProjects(t *testing.T) {
 	clickRemoteToolsAction(t, state, hitRemoteDown)
 	state.Click(hitFormSubmit)
 	waitFor(t, state, func() bool { return server.ran("docker compose -p batch down") == 1 })
+}
+
+func TestComposeConfigLinksOpenTheFileForEditing(t *testing.T) {
+	host := &documentTestHost{}
+	app.UseApplicationRunner(func(start func(app.Host) error) error { return start(host) })
+	t.Cleanup(func() { host.Quit(); app.UseApplicationRunner(nil) })
+	if err := app.RunApplication(func(application *app.Application) error {
+		state, _, fake, _ := openRemoteToolsDialogConn(t)
+		state.options.OpenContentWindow = application.OpenContentWindow
+		remote := &workbenchSFTPRemote{
+			cwd: "/srv",
+			entries: map[string][]os.FileInfo{
+				"/srv/batch": {workbenchFileInfo{name: "compose.yml", size: 21, mode: 0o644, when: time.Unix(1_700_000_000, 0)}},
+				"/srv/web":   {workbenchFileInfo{name: "compose.yml", size: 19, mode: 0o644, when: time.Unix(1_700_000_000, 0)}},
+			},
+			files: map[string][]byte{
+				"/srv/batch/compose.yml": []byte("services:\n  batch: {}\n"),
+				"/srv/web/compose.yml":   []byte("services:\n  web: {}\n"),
+			},
+		}
+		fake.mu.Lock()
+		fake.sftp = remote
+		fake.mu.Unlock()
+
+		clickSettingsChoice(t, state, state.messages.Tools.RemoteTabCompose)
+		waitFor(t, state, func() bool { return !state.remote.loading && len(state.remote.rows) == 2 })
+		canvas := remoteToolsPaint(t, state)
+		// The projects are listed by name, so batch is the first row.
+		id := hitRemoteComposeConfig.At(0*remoteComposeConfigLimit + 0)
+		hit, ok := hitByID(canvas, id)
+		if !ok || hit.Label != "/srv/batch/compose.yml" || hit.Role != gfx.RoleButton {
+			t.Fatalf("the batch config file is not a link: %+v, %t", hit, ok)
+		}
+		clickRemoteToolsPageHit(t, state, hit)
+
+		deadline := time.Now().Add(waitBudget())
+		var document *fileDocument
+		for time.Now().Before(deadline) {
+			state.Wake()
+			for _, candidate := range state.fileWindows.documents {
+				if candidate.ready {
+					document = candidate
+				}
+			}
+			if document != nil {
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		if document == nil || document.location != "/srv/batch/compose.yml" || document.original != "services:\n  batch: {}\n" {
+			t.Fatalf("document %+v", document)
+		}
+		if state.remote.selected != "batch" {
+			t.Fatalf("clicking the link did not select its project: %q", state.remote.selected)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestAServerWithoutComposeSaysSo(t *testing.T) {

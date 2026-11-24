@@ -2477,6 +2477,7 @@ var traditionalTools = ToolsMessages{
 	RemoteTabNetworks:               "網路",
 	RemoteTabCompose:                "Compose",
 	RemoteColConfig:                 "設定檔",
+	RemoteConfigEditHint:            "開啟並編輯",
 	RemoteEmptyCompose:              "沒有 Compose 專案。",
 	RemoteConfirmDownTitle:          "停用並移除此專案？",
 	RemoteConfirmDownFmt:            "專案 %s 將被停止，其容器和網路會被移除（卷保留）。",

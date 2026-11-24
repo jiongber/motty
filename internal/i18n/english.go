@@ -2477,6 +2477,7 @@ var englishTools = ToolsMessages{
 	RemoteTabNetworks:               "Networks",
 	RemoteTabCompose:                "Compose",
 	RemoteColConfig:                 "Config files",
+	RemoteConfigEditHint:            "Open for editing",
 	RemoteEmptyCompose:              "There are no compose projects.",
 	RemoteConfirmDownTitle:          "Take this project down?",
 	RemoteConfirmDownFmt:            "Project %s will be stopped and its containers and networks removed (volumes are kept).",

@@ -2477,6 +2477,7 @@ var chineseTools = ToolsMessages{
 	RemoteTabNetworks:               "网络",
 	RemoteTabCompose:                "Compose",
 	RemoteColConfig:                 "配置文件",
+	RemoteConfigEditHint:            "打开并编辑",
 	RemoteEmptyCompose:              "没有 Compose 项目。",
 	RemoteConfirmDownTitle:          "停用并移除此项目？",
 	RemoteConfirmDownFmt:            "项目 %s 将被停止，其容器和网络会被移除（卷保留）。",

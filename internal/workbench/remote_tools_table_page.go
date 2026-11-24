@@ -13,6 +13,13 @@ import (
 const (
 	remoteTableSortIconSize = float32(14)
 	remoteTableSortIconGap  = float32(4)
+	// remoteComposeConfigColumn is the Compose table's column of configuration
+	// files: each of those is a link that opens the file for editing.
+	remoteComposeConfigColumn = 2
+	// remoteComposeConfigLimit bounds the links one row paints. A row's link
+	// identities are its index times this limit plus the link's position, so the
+	// cap keeps them unique across rows.
+	remoteComposeConfigLimit = 8
 )
 
 // The sort arrows are components.Table's own glyphs, kept here because the page
@@ -216,7 +223,7 @@ func (state *State) takeRemoteTableChoice(c ui.C, tab remoteTab) {
 		return
 	}
 	view.selected = view.rows[opened].key
-	open := tab == remoteProcesses
+	open := tab == remoteProcesses || tab == remoteCompose
 	if info, clicked := c.Canvas().ClickInfo(); clicked {
 		open = info.Clicks >= 2
 	}
@@ -233,6 +240,14 @@ func (state *State) takeRemoteTableChoice(c ui.C, tab remoteTab) {
 		case remoteContainers:
 			if container, found := state.selectedContainer(); found {
 				state.openRemoteContainerDetails(container)
+			}
+		case remoteCompose:
+			// A project has no details of its own; Enter or a double click opens
+			// its first configuration file, the way a file panel opens one.
+			if project, found := state.selectedCompose(); found {
+				if files := project.ConfigFileList(); len(files) > 0 {
+					state.editRemoteComposeConfig(project.Name, files[0])
+				}
 			}
 		}
 	})
@@ -257,17 +272,11 @@ func (state *State) declareRemoteTableRow(row ui.ListRow) {
 	element.Children(func() {
 		for column := 0; column < view.tableCount; column++ {
 			spec := view.tableColumns[column]
-			cell := ui.Text(row.C, record.cells[column]).Height(height).Shrink(0).
-				FontSize(theme.Metrics.FontSizeM).Color(theme.Foreground).Ellipsis().LineHeight(height).
-				PadX(theme.Metrics.GapItem)
-			if spec.Alignment == components.TableAlignRight {
-				cell = cell.TextEnd()
+			if view.paintTab == remoteCompose && column == remoteComposeConfigColumn && len(record.config) > 0 {
+				state.declareRemoteComposeConfigCell(row, record, spec, height)
+				continue
 			}
-			if spec.Width > 0 {
-				cell.Width(spec.Width)
-			} else {
-				cell.Grow(1).Basis(0)
-			}
+			state.declareRemoteTableCell(row, record.cells[column], spec, height)
 		}
 		if row.Index+1 < len(view.rows) {
 			ui.Slot(row.C).Absolute().Left(0).Right(0).Bottom(0).Height(1).Background(theme.Border)
@@ -282,6 +291,59 @@ func (state *State) declareRemoteTableRow(row ui.ListRow) {
 	if view.rowMenuOpen && view.menuRow == row.Index {
 		ui.ContextMenuAt(row.C, row.Element, &view.rowMenuOpen, view.rowMenuAt, view.rowMenu)
 	}
+}
+
+// declareRemoteTableCell declares one text cell of a row at its fitted width.
+func (state *State) declareRemoteTableCell(row ui.ListRow, value string, spec components.TableColumn, height float32) {
+	theme := state.Theme()
+	cell := ui.Text(row.C, value).Height(height).Shrink(0).
+		FontSize(theme.Metrics.FontSizeM).Color(theme.Foreground).Ellipsis().LineHeight(height).
+		PadX(theme.Metrics.GapItem)
+	if spec.Alignment == components.TableAlignRight {
+		cell = cell.TextEnd()
+	}
+	if spec.Width > 0 {
+		cell.Width(spec.Width)
+	} else {
+		cell.Grow(1).Basis(0)
+	}
+}
+
+// declareRemoteComposeConfigCell declares a Compose row's configuration files as
+// links: clicking one opens it in the document window, where it can be read and
+// changed. The separator between two paths is not a link.
+func (state *State) declareRemoteComposeConfigCell(row ui.ListRow, record *remoteRow, spec components.TableColumn, height float32) {
+	theme, pal, m := state.Theme(), state.pal, state.messages.Tools
+	cell := ui.Row(row.C).Height(height).Shrink(1).Items(ui.Center).PadX(theme.Metrics.GapItem)
+	if spec.Width > 0 {
+		cell = cell.Width(spec.Width)
+	} else {
+		cell = cell.Grow(1).Basis(0)
+	}
+	cell.Children(func() {
+		for index, file := range record.config {
+			if index > 0 {
+				ui.Text(row.C, ", ").Height(height).Shrink(0).FontSize(theme.Metrics.FontSizeM).
+					Color(theme.Foreground).LineHeight(height)
+			}
+			id := hitRemoteComposeConfig.At(row.Index*remoteComposeConfigLimit + index)
+			color := pal.accent
+			if canvas := row.C.Canvas(); canvas != nil && (canvas.Hovered() == id || canvas.Pressed() == id) {
+				color = pal.accentHot
+			}
+			ui.Text(row.C, file).Height(height).Shrink(1).FontSize(theme.Metrics.FontSizeM).
+				Color(color).Ellipsis().LineHeight(height).
+				HitWith(id, file, gfx.HitOptions{Role: gfx.RoleButton, Hint: m.RemoteConfigEditHint})
+			if canvas := row.C.Canvas(); canvas != nil && canvas.Clicked(id) {
+				project, configFile := record.key, file
+				row.C.After(func() { state.editRemoteComposeConfig(project, configFile) })
+			}
+		}
+		if record.configMore {
+			ui.Text(row.C, ", …").Height(height).Shrink(0).FontSize(theme.Metrics.FontSizeM).
+				Color(theme.Foreground).LineHeight(height)
+		}
+	})
 }
 
 // declareRemoteTableMenu declares the open row's context menu: the row the

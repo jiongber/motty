@@ -50,6 +50,9 @@ var (
 
 // hitRemoteRowList starts the row ids: one per entry, up to the list limits.
 var hitRemoteRowList = tree.Sub(remoteToolsHits, tree.Name("remote-row"))
+
+// hitRemoteComposeConfig names the config file links of a Compose row.
+var hitRemoteComposeConfig = tree.Sub(remoteToolsHits, tree.Name("remote-compose-config"))
 var hitRemoteIntervals = tree.Sub(remoteToolsHits, tree.Name("remote-refresh-interval"))
 var hitRemoteSortColumns = tree.Sub(remoteToolsHits, tree.Name("remote-sort-column"))
 var (
@@ -156,6 +159,12 @@ type remoteRow struct {
 	orderNumber float64
 	orderText   string
 	orderValid  bool
+	// config is a Compose row's configuration files. Each is painted as a link
+	// that opens it for editing; cells[2] keeps them joined for the search.
+	config []string
+	// configMore reports that the project has more files than were painted as
+	// links.
+	configMore bool
 }
 
 type remoteToolsView struct {
@@ -593,6 +602,42 @@ func (state *State) selectedCompose() (remotetools.ComposeProject, bool) {
 	return remotetools.ComposeProject{}, false
 }
 
+// editRemoteComposeConfig opens one of a project's configuration files in the
+// document window, where it can be read and saved on the server. The view that
+// carries the connection to read it through is the file panel's, so it is made
+// if the panel has not been opened yet.
+func (state *State) editRemoteComposeConfig(project, configFile string) {
+	view := &state.remote
+	owner, session, ok := state.remoteToolsOwner()
+	if !ok {
+		view.status, view.failed = state.messages.History.StatusNotConnected, true
+		return
+	}
+	view.selected = project
+	if owner.options.OpenContentWindow == nil {
+		return
+	}
+	if session.files == nil && owner.remoteToolsOffered(session) {
+		owner.openSFTP(session)
+	}
+	if session.files == nil || session.files.openFiles == nil {
+		view.status, view.failed = state.messages.SFTPUnavailable, true
+		return
+	}
+	owner.openFileWindow(session.files, configFile, false)
+}
+
+// remoteToolsOwner is the workbench and session a tools surface acts on. A tools
+// window is a presentation copy: the session, its file view and the document
+// windows belong to the workbench that opened it.
+func (state *State) remoteToolsOwner() (*State, *Session, bool) {
+	if window := state.remoteWindow; window != nil {
+		return window.source()
+	}
+	session, ok := state.remoteSession()
+	return state, session, ok
+}
+
 func (state *State) selectedContainer() (remotetools.Container, bool) {
 	for _, container := range state.remote.containers {
 		if state.remote.selected == container.ID {
@@ -822,7 +867,12 @@ func (state *State) rebuildRemoteRows() {
 		}
 	} else if view.tab == remoteCompose {
 		for _, project := range view.compose {
-			view.rows = append(view.rows, remoteRow{key: project.Name, cells: [6]string{project.Name, project.Status, project.ConfigFiles}})
+			row := remoteRow{key: project.Name, cells: [6]string{project.Name, project.Status, project.ConfigFiles}}
+			row.config = project.ConfigFileList()
+			if len(row.config) > remoteComposeConfigLimit {
+				row.config, row.configMore = row.config[:remoteComposeConfigLimit], true
+			}
+			view.rows = append(view.rows, row)
 		}
 	} else if _, isResource := view.tab.kind(); isResource {
 		for _, resource := range view.resources {

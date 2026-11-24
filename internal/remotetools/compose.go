@@ -21,6 +21,20 @@ type ComposeProject struct {
 	ConfigFiles string // comma separated paths
 }
 
+// ConfigFileList is the project's configuration files, in the order compose
+// lists them. A project started with several -f files is reported with all of
+// them separated by commas.
+func (project ComposeProject) ConfigFileList() []string {
+	parts := strings.Split(project.ConfigFiles, ",")
+	files := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if file := strings.TrimSpace(part); file != "" {
+			files = append(files, file)
+		}
+	}
+	return files
+}
+
 const composeListCommand = "docker compose ls -a --format json 2>&1"
 
 // Compose lists every compose project, including stopped ones.
