@@ -24,8 +24,14 @@ const (
 	updateNotesPadY     float32 = 8
 	updateNotesPadRight float32 = 4
 	updateWhyLines              = 2
+	// updateDialogWidth leaves the footer's single row room for the source
+	// picker and the three actions in English, whose words are the widest the
+	// dialog ships.
+	updateDialogWidth float32 = 640
 	// updateSourceSelectWidth is the footer's source picker: the host the check
-	// and the download use, in the corner the actions leave free.
+	// and the download use, in the corner the actions leave free. It is a
+	// maximum: the select takes what the row leaves so it can shrink instead of
+	// painting over the actions when a wording is longer.
 	updateSourceSelectWidth float32 = 150
 )
 
@@ -119,6 +125,62 @@ func (state *State) declareUpdateDialog(c ui.C) {
 	m := state.messages.Tools
 	notes := &state.update.notes
 	canvas := c.Canvas()
+	viewport := dialogViewport(c)
+	contentWidth := min(updateDialogWidth, viewport.Width-32)
+	bodyWidth := contentWidth - 2*(metrics.PadSurface+metrics.GapItem)
+
+	if state.update.checking {
+		title := m.UpdateChecking
+		boxHeight := float32(100)
+		height := dialogContentHeight(canvas, *c.Theme(), viewport, contentWidth, "", boxHeight)
+		dialog := ui.Dialog(c, ui.DialogSpec{
+			Title: title, Width: contentWidth, Height: height, Layer: dialogLayer,
+			Scope: dialogScope, DismissID: hitUpdateDismiss, CloseID: hitUpdateClose, InitialFocusID: hitUpdateLater,
+		})
+		notes.box = ui.Box{}
+		dialog.Body(func() {
+			ui.Column(c).Fill().Center().Gap(12).Height(boxHeight).Children(func() {
+				ui.Spinner(c).Size(24, 24).Shrink(0)
+				ui.Text(c, m.UpdateChecking).FontSize(metrics.FontSizeS).Color(state.pal.muted).LineHeight(18)
+			})
+		})
+		dialog.Footer(func() {
+			state.declareUpdateSourceFooter(c)
+			state.dialogActionFooter(c,
+				components.ButtonAction{ID: hitUpdateLater, Label: state.messages.Cancel, Variant: components.ButtonSecondary},
+			)
+		})
+		return
+	}
+
+	if !state.update.available {
+		title := m.GeneralUpdate
+		text := state.update.text
+		if text == "" {
+			text = fmt.Sprintf(m.UpdateLatestFmt, update.Current)
+		}
+		lines := max(wrappedLines(canvas, text, metrics.FontSizeM, bodyWidth), 1)
+		boxHeight := float32(max(lines*20+32, 80))
+		height := dialogContentHeight(canvas, *c.Theme(), viewport, contentWidth, "", boxHeight)
+		dialog := ui.Dialog(c, ui.DialogSpec{
+			Title: title, Width: contentWidth, Height: height, Layer: dialogLayer,
+			Scope: dialogScope, DismissID: hitUpdateDismiss, CloseID: hitUpdateClose, InitialFocusID: hitUpdateLater,
+		})
+		notes.box = ui.Box{}
+		dialog.Body(func() {
+			ui.Column(c).Fill().Center().Gap(8).Height(boxHeight).Children(func() {
+				ui.Paragraph(c, text, lines).FontSize(metrics.FontSizeM).Color(state.pal.text).LineHeight(20)
+			})
+		})
+		dialog.Footer(func() {
+			state.declareUpdateSourceFooter(c)
+			state.dialogActionFooter(c,
+				components.ButtonAction{ID: hitUpdateLater, Label: state.messages.LabelWindowClose, Variant: components.ButtonSecondary},
+			)
+		})
+		return
+	}
+
 	install := state.canInstallUpdate()
 	why := state.whyNoInstall()
 	primary := components.ButtonAction{ID: hitUpdateDownload, Label: m.GeneralUpdateDownload}
@@ -134,9 +196,6 @@ func (state *State) declareUpdateDialog(c ui.C) {
 	// The body is as tall as what it holds, up to the cap, so a short note does
 	// not leave a gap above the buttons. The dialog narrows with the window, and
 	// the notes are laid out in the width it ends up with.
-	viewport := dialogViewport(c)
-	contentWidth := min(float32(560), viewport.Width-32)
-	bodyWidth := contentWidth - 2*(metrics.PadSurface+metrics.GapItem)
 	viewWidth := bodyWidth - updateNotesPadX - updateNotesPadRight
 	state.measureNotes(canvas, viewWidth)
 	notes.viewHeight = min(notes.contentHeight, updateNotesMaxHeight)
@@ -182,12 +241,16 @@ func (state *State) declareUpdateDialog(c ui.C) {
 // after it stay against the right edge.
 func (state *State) declareUpdateSourceFooter(c ui.C) {
 	m := state.messages.Tools
-	row := ui.Row(c).Grow(1).Items(ui.Center).Gap(8)
+	row := ui.Row(c).Grow(1).Shrink(1).Items(ui.Center).Gap(8)
 	row.Children(func() {
 		ui.Text(c, m.GeneralUpdateSource).FontSize(metrics.FontSizeS).Color(state.pal.muted).LineHeight(18).Shrink(0)
-		selector := ui.Select(c, &state.update.source, settingsUpdateSourceChoices[:], state.settingsUpdateSourceLabel).Width(updateSourceSelectWidth)
+		selector := ui.Select(c, &state.update.source, settingsUpdateSourceChoices[:], state.settingsUpdateSourceLabel).
+			FillWidth().MaxWidth(updateSourceSelectWidth).Disabled(state.update.checking)
 		if selector.Changed() {
 			c.After(state.changeUpdateSource)
+		}
+		if state.update.checking {
+			ui.Spinner(c).Size(16, 16).Shrink(0)
 		}
 	})
 }

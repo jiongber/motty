@@ -158,10 +158,29 @@ func (state *State) deleteHostGroup(path string, ungroup bool) bool {
 	if ungroup {
 		target = ""
 	}
+	// The hosts leave the group together, so the move is checked before it is
+	// made: a host the target group already holds, or one that repeats another
+	// host on its way out, would be folded away on the next start.
+	var moving []int
 	for index := range state.hosts {
 		if hostGroupWithin(strings.TrimSpace(state.hosts[index].Group), path) {
-			state.hosts[index].Group = target
+			moving = append(moving, index)
 		}
+	}
+	// Both choices move the hosts into target (the parent group, or none), so a
+	// host target already holds makes the group impossible to delete until it is
+	// dealt with. Say which one, so the user has a next step rather than only
+	// "this host already exists".
+	if repeat, ok := groupMoveRepeat(state.hosts, moving, target); ok {
+		label := target
+		if label == "" {
+			label = state.messages.HostGroupDefault
+		}
+		state.dialogError = fmt.Sprintf(state.messages.HostGroupDeleteRepeatFmt, strings.TrimSpace(repeat.Label), repeat.Address, label)
+		return false
+	}
+	for _, index := range moving {
+		state.hosts[index].Group = target
 	}
 	kept := state.hostGroups[:0]
 	for _, group := range state.hostGroups {
@@ -291,7 +310,7 @@ func (state *State) paintHostGroupParentSelect(canvas *gfx.Canvas, bounds, viewp
 	}
 	control := components.BeginSelect(canvas, state.Theme(), bounds, components.SelectOptions{
 		TriggerID: hitMoveGroupField, Label: m.Parent, Value: value, Open: a.parentOpen,
-		Content: gfx.Rect{X: bounds.X, Y: bounds.Y + bounds.Height + 4, Width: bounds.Width, Height: float32(8 + min(count, 8)*32)},
+		Content: hostGroupParentList(bounds, count, viewport),
 		Layer:   dialogLayer + 1, Scope: dialogScope, DismissID: hitGroupParentDismiss, Viewport: viewport,
 		Scroll: state.selectScroll(a.parentOpen, hitGroupParentDismiss),
 	})
@@ -307,4 +326,12 @@ func (state *State) paintHostGroupParentSelect(canvas *gfx.Canvas, bounds, viewp
 		}
 		control.AddItem(components.SelectItem{ID: hitGroupParentItems.At(index), Label: group.Name, Selected: state.hostGroupEditor.String() == group.Name})
 	}
+}
+
+// hostGroupParentList is where the parent select's list goes: under the field, or
+// above it with more room there, shortened to the room it has.
+func hostGroupParentList(field gfx.Rect, count int, viewport gfx.Rect) gfx.Rect {
+	list, _ := components.PlaceOverlay(field, gfx.Size{Width: field.Width, Height: float32(8 + min(count, 8)*32)}, viewport,
+		components.OverlayPlacement{Side: components.OverlayBottom, Align: components.OverlayAlignStart, SideOffset: 4, Margin: 8, Fit: true})
+	return list
 }

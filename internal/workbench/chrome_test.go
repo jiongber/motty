@@ -309,7 +309,7 @@ func TestTheSectionToolbarsCondenseIntoIcons(t *testing.T) {
 	}{
 		{"keys", sectionKeys, []gfx.ID{hitKeysAdd, hitKeysCopyPublic, hitKeysRemove}},
 		{"proxies", sectionProxies, []gfx.ID{hitProxyBatchAdd, hitProxyAdd}},
-		{"forwards", sectionForwards, []gfx.ID{hitForwardAdd, hitForwardEdit, hitForwardStartStop, hitForwardRemove}},
+		{"forwards", sectionForwards, []gfx.ID{hitForwardAdd}},
 		{"known hosts", sectionKnownHosts, []gfx.ID{hitKnownHostsRefresh, hitKnownHostsRetrust, hitKnownHostsDelete}},
 	}
 	for _, section := range sections {
@@ -494,7 +494,7 @@ func TestDialogFieldsShowEachHintOnlyOnce(t *testing.T) {
 	state.Click(hitAddHost)
 	_, texts := paintedTexts(state)
 	m := state.messages
-	for _, placeholder := range []string{m.FieldLabelPlaceholder, m.FieldAddressPlaceholder, m.FieldUserPlaceholder, m.FieldGroupPlaceholder} {
+	for _, placeholder := range []string{m.FieldLabelPlaceholder, m.FieldAddressPlaceholder, state.hostSystemUserHint(), m.FieldGroupPlaceholder} {
 		count := 0
 		for _, value := range texts {
 			if value == placeholder {

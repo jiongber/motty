@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/pkg/sftp"
 )
 
 func queueResult(t *testing.T, id uint64, queued bool, worker *Worker) Result {
@@ -178,25 +180,147 @@ func TestWorkerUploadRequiresConfirmationAndResumesMatchingPartial(t *testing.T)
 	}
 }
 
-func TestRecursiveTransferRejectsSymbolicLinksBeforeWriting(t *testing.T) {
-	worker, root := newProtocolWorker(t)
-	localRoot := filepath.Join(t.TempDir(), "tree")
-	if err := os.Mkdir(localRoot, 0o755); err != nil {
+// linkRecorder keeps the target text of every link the worker asks a server
+// for. The in-process test server joins a relative target to its own folder,
+// which OpenSSH does not, so what the server stored cannot show what was sent.
+type linkRecorder struct {
+	remote
+	mu   sync.Mutex
+	sent map[string]string
+}
+
+func (recorder *linkRecorder) Symlink(target, link string) error {
+	recorder.mu.Lock()
+	recorder.sent[link] = target
+	recorder.mu.Unlock()
+	return recorder.remote.Symlink(target, link)
+}
+
+// makeAppTree builds a folder in the shape of a macOS .app bundle and returns
+// the links in it, by path relative to the folder, with their target text.
+func makeAppTree(t *testing.T, base string) map[string]string {
+	t.Helper()
+	versions := filepath.Join(base, "Contents", "Frameworks", "X.framework", "Versions")
+	if err := os.MkdirAll(filepath.Join(versions, "A"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink("outside", filepath.Join(localRoot, "link")); err != nil {
+	if err := os.WriteFile(filepath.Join(versions, "A", "X"), []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	links := map[string]string{
+		"Contents/Frameworks/X.framework/Versions/Current": "A", // a link to a folder
+		"Contents/up":             "../..",      // leads back up the tree
+		"Contents/Frameworks/abs": "/etc/hosts", // leaves the folder
+		"Contents/dangling":       "missing",
+	}
+	for link, target := range links {
+		linkPath := filepath.Join(base, filepath.FromSlash(link))
+		if err := os.Symlink(target, linkPath); err != nil {
+			if runtime.GOOS == "windows" && errors.Is(err, syscall.Errno(1314)) {
+				t.Skipf("Windows account lacks symbolic-link privilege: %v", err)
+			}
+			t.Fatal(err)
+		}
+		// Windows 会规范化符号链接目标，断言应保留磁盘中实际存储的文本。
+		storedTarget, err := os.Readlink(linkPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		links[link] = storedTarget
+	}
+	return links
+}
+
+// A folder holding symbolic links, such as a macOS .app bundle, moves as the
+// folder it is: each link arrives as a link with the same target text, nothing
+// behind a link is read, and the files around it are intact.
+func TestFolderTransferKeepsSymbolicLinksAsLinks(t *testing.T) {
+	recorder := &linkRecorder{sent: map[string]string{}}
+	worker, root := newProtocolWorkerOn(t, nil, func(client remote) Remote {
+		recorder.remote = client
+		return recorder
+	})
+	localRoot := filepath.Join(t.TempDir(), "App.app")
+	links := makeAppTree(t, localRoot)
+	binary := filepath.FromSlash("Contents/Frameworks/X.framework/Versions/A/X")
+
+	id, queued := worker.QueueUpload(localRoot, "Up.app", true, ExistingFail)
+	result := queueResult(t, id, queued, worker)
+	if result.Err != nil || result.Files != 1 || result.Bytes != int64(len("binary")) {
+		t.Fatalf("upload result = %+v", result)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "Up.app", binary)); err != nil || string(got) != "binary" {
+		t.Fatalf("file beside the links = %q, %v", got, err)
+	}
+	for link, target := range links {
+		if sent := recorder.sent["Up.app/"+link]; sent != target {
+			t.Fatalf("%s was sent as %q, want %q", link, sent, target)
+		}
+		if info, err := os.Lstat(filepath.Join(root, "Up.app", filepath.FromSlash(link))); err != nil || info.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("%s is not a link on the server: %v, %v", link, info, err)
+		}
+	}
+
+	// Sending it again over what is there keeps a link that did not move and
+	// never removes a file to make room for one.
+	id, queued = worker.QueueUpload(localRoot, "Up.app", true, ExistingReplace)
+	if result = queueResult(t, id, queued, worker); result.Err != nil {
+		t.Fatalf("second upload result = %+v", result)
+	}
+	dangling := filepath.Join(root, "Up.app", "Contents", "dangling")
+	if err := os.Remove(dangling); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dangling, []byte("mine"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	id, queued = worker.QueueUpload(localRoot, "Up.app", true, ExistingReplace)
+	if result = queueResult(t, id, queued, worker); !errors.Is(result.Err, ErrDestinationExists) {
+		t.Fatalf("link over a file result = %+v", result)
+	}
+	if got, err := os.ReadFile(dangling); err != nil || string(got) != "mine" {
+		t.Fatalf("the file was removed for a link: %q, %v", got, err)
+	}
+
+	// The other way: a folder on the server whose links are real links.
+	links = makeAppTree(t, filepath.Join(root, "Down.app"))
+	downloaded := filepath.Join(t.TempDir(), "Down.app")
+	id, queued = worker.QueueDownload("Down.app", downloaded, true, ExistingFail)
+	result = queueResult(t, id, queued, worker)
+	if result.Err != nil || result.Files != 1 || result.Bytes != int64(len("binary")) {
+		t.Fatalf("download result = %+v", result)
+	}
+	if got, err := os.ReadFile(filepath.Join(downloaded, binary)); err != nil || string(got) != "binary" {
+		t.Fatalf("downloaded file = %q, %v", got, err)
+	}
+	for link, target := range links {
+		if got, err := os.Readlink(filepath.Join(downloaded, filepath.FromSlash(link))); err != nil || got != target {
+			t.Fatalf("%s points at %q, %v; want %q", link, got, err, target)
+		}
+	}
+	id, queued = worker.QueueDownload("Down.app", downloaded, true, ExistingReplace)
+	if result = queueResult(t, id, queued, worker); result.Err != nil {
+		t.Fatalf("second download result = %+v", result)
+	}
+}
+
+// A link the user selected is not a part of a folder, so it is still refused.
+func TestTransferRejectsASelectedSymbolicLink(t *testing.T) {
+	worker, root := newProtocolWorker(t)
+	localLink := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink("outside", localLink); err != nil {
 		if runtime.GOOS == "windows" && errors.Is(err, syscall.Errno(1314)) {
 			t.Skipf("Windows account lacks symbolic-link privilege: %v", err)
 		}
 		t.Fatal(err)
 	}
-	id, queued := worker.QueueUpload(localRoot, "unsafe", true, ExistingFail)
+	id, queued := worker.QueueUpload(localLink, "unsafe", true, ExistingFail)
 	result := queueResult(t, id, queued, worker)
 	if !errors.Is(result.Err, ErrSymbolicLink) {
 		t.Fatalf("symlink result = %+v", result)
 	}
-	if _, err := os.Stat(filepath.Join(root, "unsafe")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("remote root was written before preflight: %v", err)
+	if _, err := os.Lstat(filepath.Join(root, "unsafe")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("remote path was written for a link: %v", err)
 	}
 
 	if err := os.Symlink("missing", filepath.Join(root, "remote-link")); err != nil {
@@ -208,7 +332,7 @@ func TestRecursiveTransferRejectsSymbolicLinksBeforeWriting(t *testing.T) {
 	if !errors.Is(result.Err, ErrSymbolicLink) {
 		t.Fatalf("remote symlink result = %+v", result)
 	}
-	if _, err := os.Stat(target); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Lstat(target); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("local target was written for symlink: %v", err)
 	}
 }
@@ -360,6 +484,46 @@ func TestUploadCompletesWhenServerDoesNotAdvertisePosixRename(t *testing.T) {
 	}
 	if noPosix.posixCalls != 0 || noPosix.renameCalls != 1 {
 		t.Fatalf("posix calls = %d, rename calls = %d", noPosix.posixCalls, noPosix.renameCalls)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "payload.txt")); err != nil || !bytes.Equal(got, content) {
+		t.Fatalf("uploaded content = %q, err %v", got, err)
+	}
+	requireExists(t, filepath.Join(root, remotePartialPath("payload.txt", source)), false)
+}
+
+// chmodRefusingRemote answers every permission change with the generic failure
+// status, as a gateway that does not pass SETSTAT through to the account does.
+type chmodRefusingRemote struct {
+	remote
+	chmodCalls int
+}
+
+func (remote *chmodRefusingRemote) Chmod(string, os.FileMode) error {
+	remote.chmodCalls++
+	return &sftp.StatusError{Code: uint32(sftp.ErrSSHFxFailure)}
+}
+
+func TestUploadCompletesWhenServerRefusesPermissionChange(t *testing.T) {
+	refusing := &chmodRefusingRemote{}
+	worker, root := newProtocolWorkerOn(t, nil, func(base remote) Remote {
+		refusing.remote = base
+		return refusing
+	})
+	content := []byte("upload through a gateway that refuses setstat\n")
+	source := filepath.Join(t.TempDir(), "payload.txt")
+	if err := os.WriteFile(source, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	id, queued := worker.QueueUpload(source, "payload.txt", false, ExistingFail)
+	if !queued {
+		t.Fatal("upload was not queued")
+	}
+	result := resultWithin(t, worker, 10*time.Second)
+	if result.TransferID != id || result.Err != nil {
+		t.Fatalf("result = %+v", result)
+	}
+	if refusing.chmodCalls == 0 {
+		t.Fatal("the upload never asked for the permission change")
 	}
 	if got, err := os.ReadFile(filepath.Join(root, "payload.txt")); err != nil || !bytes.Equal(got, content) {
 		t.Fatalf("uploaded content = %q, err %v", got, err)

@@ -1,10 +1,33 @@
 package workbench
 
 import (
+	"github.com/vivaui/viva/base"
+	"github.com/vivaui/viva/field"
 	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/text"
 	"github.com/vivaui/viva/ui"
 )
+
+// dialogRowGap is the air a dialog's form leaves under a field's control,
+// between the control and the title of the row below it, and dialogCheckHeight
+// is the room a checkbox row and its margins take. They are the dialog rhythm
+// rather than a spacing token: every dialog shares it, so a form that sums its
+// body's height can use the same numbers the rows are declared with.
+const (
+	dialogRowGap         = 10
+	dialogCheckHeight    = 20
+	dialogCheckGapAbove  = 4
+	dialogCheckGapBelow  = 6
+	dialogCheckRowHeight = dialogCheckHeight + dialogCheckGapAbove + dialogCheckGapBelow
+)
+
+// dialogRowHeight is the height of one labelled row of a dialog's form: the
+// field's title, the space under it, the control, and the dialog's gap under the
+// control.
+func dialogRowHeight(theme *base.Theme) float32 {
+	metrics := theme.Metrics
+	return field.TitleHeight(metrics) + field.Gap(metrics) + metrics.ControlHeight + dialogRowGap
+}
 
 // dialogField is a labelled single-line field of a dialog the page declares: its
 // row, its text bound to an editor the application owns, and, for a secret, whether
@@ -24,7 +47,7 @@ type dialogField struct {
 type dialogFieldSpec struct {
 	ID                                     gfx.ID
 	Label, Description, Placeholder, Error string
-	Secret, Invalid, Disabled              bool
+	Secret, Invalid, Disabled, Multiline   bool
 	Height                                 float32
 }
 
@@ -40,6 +63,15 @@ func (f *dialogField) declare(c ui.C, state *State, editor *text.Editor, spec di
 	f.input.Disabled = spec.Disabled
 	f.row.For, f.row.Description, f.row.Error = spec.ID, spec.Description, spec.Error
 	f.row.Invalid = spec.Invalid || spec.Error != ""
+	if spec.Multiline {
+		theme := c.Theme()
+		metrics := theme.Metrics
+		ui.Column(c).FillWidth().Height(spec.Height).Shrink(0).PadSides(0, 0, dialogRowGap, 0).Gap(metrics.GapItem / 2).Children(func() {
+			ui.Text(c, spec.Label).FontSize(metrics.FontSizeM).Weight(gfx.WeightMedium).Color(theme.Foreground).LineHeight(metrics.FontSizeM + 4).Ellipsis().LabelFor(spec.ID)
+			f.box = ui.TextAreaID(c, spec.ID, &f.input, spec.Label, spec.Placeholder).FillWidth().Grow(1)
+		})
+		return
+	}
 	ui.FormField(c, &f.row, spec.Label).FillWidth().Height(spec.Height).Children(func() {
 		box := ui.TextFieldID(c, spec.ID, &f.input, spec.Label, spec.Placeholder)
 		f.box = box
@@ -91,7 +123,7 @@ func (state *State) pageFlag(on bool) *bool {
 // given room above and below it. A press, or Space on it, is the central click
 // handler's under id.
 func (state *State) declareDialogCheck(c ui.C, id gfx.ID, label string, checked bool, above, below float32) ui.Box {
-	row := ui.Row(c).Height(20).Items(ui.Center).MarginSides(above, 0, below, 2).Children(func() {
+	row := ui.Row(c).Height(dialogCheckHeight).Items(ui.Center).MarginSides(above, 0, below, 2).Children(func() {
 		ui.Checkbox(c, state.pageFlag(checked), label).Hit(id, label).Grow(1)
 	})
 	state.noteCheck(id, row)
@@ -101,7 +133,7 @@ func (state *State) declareDialogCheck(c ui.C, id gfx.ID, label string, checked 
 // declareDialogCheckDisabled is declareDialogCheck dimmed and inert: it is not a tab
 // stop, and its words do not toggle it or reach the click handler.
 func (state *State) declareDialogCheckDisabled(c ui.C, id gfx.ID, label string, checked bool, above, below float32) ui.Box {
-	return ui.Row(c).Height(20).Items(ui.Center).MarginSides(above, 0, below, 2).Children(func() {
+	return ui.Row(c).Height(dialogCheckHeight).Items(ui.Center).MarginSides(above, 0, below, 2).Children(func() {
 		ui.Checkbox(c, state.pageFlag(checked), label).Hit(id, label).Disabled(true).Grow(1)
 	})
 }
@@ -127,7 +159,7 @@ func (state *State) rememberDialogChecks() {
 // declareDialogCheckHelp is declareDialogCheck with a help icon right after the label,
 // which paintHelpIcon fills in.
 func (state *State) declareDialogCheckHelp(c ui.C, id gfx.ID, label string, checked bool, above, below float32) (row, help ui.Box) {
-	row = ui.Row(c).Height(20).Gap(8).Items(ui.Center).MarginSides(above, 0, below, 2).Children(func() {
+	row = ui.Row(c).Height(dialogCheckHeight).Gap(8).Items(ui.Center).MarginSides(above, 0, below, 2).Children(func() {
 		ui.Checkbox(c, state.pageFlag(checked), label).Hit(id, label).Shrink(0)
 		help = ui.Slot(c).Size(16, 16).Shrink(0)
 		ui.Spacer(c).Grow(1)

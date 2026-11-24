@@ -11,6 +11,7 @@ import (
 	"github.com/vivaui/viva/app"
 	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/headless"
+	"github.com/vivaui/viva/keymap"
 	"motty/internal/i18n"
 	"motty/internal/sshconn"
 	layoutcore "motty/internal/workspace"
@@ -256,6 +257,100 @@ func TestRemoteNativeWindowDoesNotBlockTheWorkbenchAndKeepsItsServer(t *testing.
 	})
 }
 
+func TestRemoteNativeWindowCloseShortcut(t *testing.T) {
+	for _, name := range []string{"default", "search", "process details", "container details", "rebound", "release", "repeat", "form", "sudo", "menu"} {
+		t.Run(name, func(t *testing.T) {
+			withRemoteWindowApplication(t, func(application *app.Application, host *remoteWindowHost) {
+				state, _, fake, _ := liveSession(t)
+				fake.mu.Lock()
+				fake.runCommand = (&remoteServer{}).run
+				fake.mu.Unlock()
+				state.options.OpenContentWindow = application.OpenContentWindow
+				state.Click(hitRemoteToolsOpen)
+				w := state.remoteWindows[0]
+				host.until(t, func() bool { return !w.ui.remote.loading })
+				wantTitle := state.messages.Tools.RemoteMenu + " · " + w.session.Title + " · " + w.session.Address
+				if host.windows[0].config.Title != wantTitle {
+					t.Fatalf("window title = %q, want %q", host.windows[0].config.Title, wantTitle)
+				}
+				sourceID := state.activeSessionID
+				event := gfx.KeyEvent{Key: gfx.Key('w'), Text: "w", Modifiers: keymap.Primary}
+				wantClose := true
+				switch name {
+				case "search":
+					event.Target = hitRemoteSearch
+				case "process details":
+					w.ui.remote.processDetails.open = true
+				case "container details":
+					w.ui.remote.containerDetails.open = true
+				case "rebound":
+					state.shortcuts.chords.Set(shortcutCloseTab, keymap.Chord{Modifiers: keymap.Primary | gfx.ModifierShift, Char: 'w'})
+					if w.shortcut(event).Handled || w.closed {
+						t.Fatal("default close chord remained active after rebinding")
+					}
+					event.Modifiers |= gfx.ModifierShift
+				case "release":
+					event.Release, wantClose = true, false
+				case "repeat":
+					event.Repeat, wantClose = true, false
+				case "form":
+					w.ui.modal, wantClose = modalForm, false
+				case "sudo":
+					w.ui.modal, wantClose = modalSudoSFTP, false
+				case "menu":
+					w.ui.remote.auto.open, wantClose = true, false
+				}
+				result := w.shortcut(event)
+				if w.closed != wantClose || host.windows[0].done != wantClose {
+					t.Fatalf("closed = %v, native closed = %v, want %v", w.closed, host.windows[0].done, wantClose)
+				}
+				if wantClose && (!result.Handled || len(state.remoteWindows) != 0 || w.ctx.Err() == nil) {
+					t.Fatal("close shortcut left the window or its work alive")
+				}
+				if _, ok := state.sessionByIDPointer(sourceID); !ok {
+					t.Fatal("close shortcut removed the source SSH session")
+				}
+				fake.mu.Lock()
+				canceled := fake.canceled
+				fake.mu.Unlock()
+				if canceled != 0 {
+					t.Fatal("close shortcut disconnected SSH")
+				}
+			})
+		})
+	}
+}
+
+func TestRemoteNativeWindowCloseShortcutThroughDriver(t *testing.T) {
+	withRemoteWindowApplication(t, func(application *app.Application, host *remoteWindowHost) {
+		state, _, fake, _ := liveSession(t)
+		fake.mu.Lock()
+		fake.runCommand = (&remoteServer{}).run
+		fake.mu.Unlock()
+		state.options.OpenContentWindow = application.OpenContentWindow
+		state.Click(hitRemoteToolsOpen)
+		w := state.remoteWindows[0]
+		host.until(t, func() bool { return !w.ui.remote.loading })
+		driver, err := app.NewDriver(host.windows[0].config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer driver.Close()
+		if err := driver.Chord(keymap.Primary, "f"); err != nil {
+			t.Fatal(err)
+		}
+		if driver.Snapshot().Focused != hitRemoteSearch {
+			t.Fatal("Find did not focus the tools search")
+		}
+		if err := driver.Chord(keymap.Primary, "w"); err != nil {
+			t.Fatal(err)
+		}
+		if !w.closed || !host.windows[0].done || len(state.remoteWindows) != 0 || len(state.sessions) == 0 {
+			t.Fatal("driver close chord did not close only the tools window")
+		}
+	})
+}
+
 func TestRemoteNativeWindowCloseCancelsWorkAndRejectsLateResults(t *testing.T) {
 	withRemoteWindowApplication(t, func(application *app.Application, host *remoteWindowHost) {
 		state, _, fake, _ := liveSession(t)
@@ -475,6 +570,14 @@ func TestRemoteNativeWindowResizesWithReachableActionsAndVirtualScroll(t *testin
 						t.Fatalf("language %v viewport %+v: control %q is unreachable: %+v", language, size, control.label, hit)
 					}
 				}
+				// The refresh controls share the tabs' line where the content is
+				// wide enough for both, and go under the tabs where it is not.
+				tabs, tabsOK := hitByLabelAny(&canvas, w.ui.remoteTabLabel(remoteProcesses))
+				refresh, _ := hitByLabelRole(&canvas, state.messages.Tools.RemoteRefresh, gfx.RoleButton)
+				inline := refresh.Bounds.Y < tabs.Bounds.Y+tabs.Bounds.Height
+				if wantInline := size.Width-2*remoteToolsContentPad >= remoteToolsInlineToolbarWidth; !tabsOK || inline != wantInline {
+					t.Fatalf("language %v viewport %+v: refresh at %+v beside the tabs at %+v = %v, want %v", language, size, refresh.Bounds, tabs.Bounds, inline, wantInline)
+				}
 				if _, ok := hitByLabelRoleLast(&canvas, state.messages.KnownHostsNext, gfx.RoleButton); ok {
 					t.Fatal("process list still paints pagination controls")
 				}
@@ -515,7 +618,7 @@ func TestRemoteNativeWindowScrollsThroughAllDockerObjects(t *testing.T) {
 			for index := range w.ui.remote.rows {
 				w.ui.remote.rows[index] = remoteRow{
 					key:   fmt.Sprintf("resource-%02d", index),
-					cells: [6]string{fmt.Sprintf("resource-%02d", index)},
+					cells: [remoteMaxColumns]string{fmt.Sprintf("resource-%02d", index)},
 				}
 			}
 			var canvas gfx.Canvas
@@ -572,7 +675,7 @@ func TestRemoteNativeWindowWheelEndsOutsideTheTable(t *testing.T) {
 		for index := range w.ui.remote.rows {
 			w.ui.remote.rows[index] = remoteRow{
 				key:   fmt.Sprintf("wheel-row-%02d", index),
-				cells: [6]string{fmt.Sprintf("%d", index+1)},
+				cells: [remoteMaxColumns]string{fmt.Sprintf("%d", index+1)},
 			}
 		}
 		remoteWindowListHit(t, w, size)
@@ -611,7 +714,7 @@ func TestRemoteNativeWindowTableSurfacePaintsUnderItsRows(t *testing.T) {
 		state.Click(hitRemoteToolsOpen)
 		w := state.remoteWindows[0]
 		host.until(t, func() bool { return !w.ui.remote.loading })
-		w.ui.remote.rows = []remoteRow{{key: "surface-row", cells: [6]string{"row-0"}}}
+		w.ui.remote.rows = []remoteRow{{key: "surface-row", cells: [remoteMaxColumns]string{"row-0"}}}
 
 		size := gfx.Size{Width: 1100, Height: 780}
 		var canvas gfx.Canvas
@@ -678,7 +781,7 @@ func TestRemoteNativeWindowRowHitTestFollowsPaintedRows(t *testing.T) {
 		for index := range w.ui.remote.rows {
 			w.ui.remote.rows[index] = remoteRow{
 				key:   fmt.Sprintf("resource-%02d", index),
-				cells: [6]string{fmt.Sprintf("resource-%02d", index)},
+				cells: [remoteMaxColumns]string{fmt.Sprintf("resource-%02d", index)},
 			}
 		}
 		var canvas gfx.Canvas

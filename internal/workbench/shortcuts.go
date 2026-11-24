@@ -8,6 +8,7 @@ import (
 	"github.com/vivaui/viva/app"
 	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/keymap"
+	"github.com/vivaui/viva/text"
 	"motty/internal/term"
 )
 
@@ -21,7 +22,10 @@ const (
 	shortcutCopy
 	shortcutPaste
 	shortcutNewTab
+	shortcutDuplicateTab
+	shortcutTerminalFolder
 	shortcutLocalTerminal
+	shortcutDuplicateTerminal
 	shortcutCloseTab
 	shortcutNextTab
 	shortcutPreviousTab
@@ -43,7 +47,9 @@ const (
 	shortcutSnippetPicker
 	shortcutHostsPanel
 	shortcutAcceptSuggestion
+	shortcutPaneMaximize
 	shortcutSettings
+	shortcutBroadcast
 	shortcutActionCount
 )
 
@@ -67,13 +73,14 @@ func newShortcutMap() shortcutMap {
 	return shortcutMap{chords: keymap.NewTable[shortcutAction](int(shortcutActionCount))}
 }
 
-// primaryModifier and paneSplitChords are keymap.Primary and
-// defaultPaneSplitChords with a seam for the paint goldens: production takes
-// this platform's chords, while a golden pins one platform's so the same
-// snapshots hold everywhere.
+// primaryModifier, paneSplitChords and broadcastChord are keymap.Primary,
+// defaultPaneSplitChords and defaultBroadcastChord with a seam for the paint
+// goldens: production takes this platform's chords, while a golden pins one
+// platform's so the same snapshots hold everywhere.
 var (
 	primaryModifier = keymap.Primary
 	paneSplitChords = defaultPaneSplitChords
+	broadcastChord  = defaultBroadcastChord
 )
 
 func defaultShortcuts() shortcutMap {
@@ -85,7 +92,13 @@ func defaultShortcuts() shortcutMap {
 	shortcuts.chords.Set(shortcutCopy, keymap.Chord{Modifiers: primary, Char: 'c'})
 	shortcuts.chords.Set(shortcutPaste, keymap.Chord{Modifiers: primary, Char: 'v'})
 	shortcuts.chords.Set(shortcutNewTab, keymap.Chord{Modifiers: primary, Char: 't'})
+	// Ctrl+Shift+D is the split default on Windows and Linux, and
+	// Command+Shift+D splits vertically on a Mac, so Duplicate takes Alt as
+	// well. It stays on the same letter as Windows Terminal's Duplicate Tab.
+	shortcuts.chords.Set(shortcutDuplicateTab, keymap.Chord{Modifiers: primary | gfx.ModifierAlt | gfx.ModifierShift, Char: 'd'})
+	shortcuts.chords.Set(shortcutTerminalFolder, keymap.Chord{Modifiers: gfx.ModifierControl | gfx.ModifierShift, Char: 'r'})
 	shortcuts.chords.Set(shortcutLocalTerminal, keymap.Chord{Modifiers: primary | gfx.ModifierShift, Char: 't'})
+	shortcuts.chords.Set(shortcutDuplicateTerminal, keymap.Chord{Modifiers: gfx.ModifierAlt | gfx.ModifierShift, Char: 't'})
 	shortcuts.chords.Set(shortcutCloseTab, keymap.Chord{Modifiers: primary, Char: 'w'})
 	// Control+Tab is how browsers, VS Code and Windows Terminal switch tabs on
 	// every platform, the Mac included, where Command+Tab is the system's.
@@ -99,6 +112,7 @@ func defaultShortcuts() shortcutMap {
 	splitHorizontal, splitVertical := paneSplitChords()
 	shortcuts.chords.Set(shortcutPaneSplitHorizontal, splitHorizontal)
 	shortcuts.chords.Set(shortcutPaneSplitVertical, splitVertical)
+	shortcuts.chords.Set(shortcutPaneMaximize, keymap.Chord{Modifiers: primary | gfx.ModifierShift, Char: 'm'})
 	shortcuts.chords.Set(shortcutPaneClose, keymap.Chord{Modifiers: primary | gfx.ModifierAlt, Char: 'w'})
 	shortcuts.chords.Set(shortcutFilesPath, keymap.Chord{Modifiers: primary, Char: 'l'})
 	shortcuts.chords.Set(shortcutSFTP, keymap.Chord{Modifiers: primary | gfx.ModifierShift, Char: 's'})
@@ -116,6 +130,7 @@ func defaultShortcuts() shortcutMap {
 	// the suggestion names it and the user can choose another one there.
 	shortcuts.chords.Set(shortcutAcceptSuggestion, keymap.Chord{Key: gfx.KeyRight})
 	shortcuts.chords.Set(shortcutSettings, keymap.Chord{Modifiers: primary, Char: ','})
+	shortcuts.chords.Set(shortcutBroadcast, broadcastChord())
 	shortcuts.refreshLabels()
 	return shortcuts
 }
@@ -309,6 +324,25 @@ func (shortcuts *shortcutMap) unbind(action shortcutAction) bool {
 	return true
 }
 
+// unbindAll takes the chord away from every action, for a user who wants none
+// of the defaults and will give back only the ones they use. Each action keeps
+// its row reading "—", as after unbind, and Reset defaults brings the table back.
+func (shortcuts *shortcutMap) unbindAll() {
+	for action := shortcutAction(1); action < shortcutActionCount; action++ {
+		shortcuts.unbind(action)
+	}
+}
+
+// anyBound reports whether some action still has a chord.
+func (shortcuts *shortcutMap) anyBound() bool {
+	for action := shortcutAction(1); action < shortcutActionCount; action++ {
+		if shortcuts.chords.Chord(action).Valid() {
+			return true
+		}
+	}
+	return false
+}
+
 func (action shortcutAction) String() string {
 	switch action {
 	case shortcutCommandPalette:
@@ -323,6 +357,12 @@ func (action shortcutAction) String() string {
 		return "paste"
 	case shortcutNewTab:
 		return "new_tab"
+	case shortcutDuplicateTab:
+		return "duplicate_tab"
+	case shortcutDuplicateTerminal:
+		return "duplicate_terminal"
+	case shortcutTerminalFolder:
+		return "terminal_folder"
 	case shortcutLocalTerminal:
 		return "local_terminal"
 	case shortcutCloseTab:
@@ -341,6 +381,8 @@ func (action shortcutAction) String() string {
 		return "pane_split_horizontal"
 	case shortcutPaneSplitVertical:
 		return "pane_split_vertical"
+	case shortcutPaneMaximize:
+		return "pane_maximize"
 	case shortcutPaneClose:
 		return "pane_close"
 	case shortcutFilesPath:
@@ -369,6 +411,8 @@ func (action shortcutAction) String() string {
 		return "accept_suggestion"
 	case shortcutSettings:
 		return "settings"
+	case shortcutBroadcast:
+		return "broadcast_input"
 	default:
 		return ""
 	}
@@ -451,6 +495,23 @@ func (state *State) shortcut(event gfx.KeyEvent, chord keymap.Chord) gfx.EventRe
 	if chord == state.shortcuts.chords.Chord(shortcutAcceptSuggestion) {
 		return gfx.EventResult{}
 	}
+	// Ctrl+W is the shell's word-delete key, even when it is also the default
+	// close-tab binding. Decline both the press and the release before shortcut
+	// routing consumes them; terminalKey encodes the program's keyboard mode.
+	if chord.Modifiers == gfx.ModifierControl && chord.Char == 'w' &&
+		state.shortcuts.actionFor(chord) == shortcutCloseTab && state.modal == modalNone && state.terminalPage() {
+		_, target, embedded := state.decodePaneHit(event.Target)
+		if !embedded {
+			target = event.Target
+		}
+		session := state.terminalSession(target)
+		if session == nil {
+			session = state.terminalPageSession(target)
+		}
+		if session != nil && state.paintsTerminalPane(session) && session.term.shell != nil && !session.term.ended {
+			return gfx.EventResult{}
+		}
+	}
 	if state.notesVisible() && (state.notes.view.menu != "" || state.notes.view.popup != "" || state.notes.view.drawer || state.notes.confirm != "") {
 		action := state.shortcuts.actionFor(chord)
 		if action == shortcutCopy || action == shortcutPaste || action == shortcutNone {
@@ -501,6 +562,9 @@ func (state *State) shortcut(event gfx.KeyEvent, chord keymap.Chord) gfx.EventRe
 	if result, handled := state.remoteDetailShortcut(event); handled {
 		return result
 	}
+	if result, handled := state.remoteLogShortcut(event); handled {
+		return result
+	}
 	if state.modal != modalNone {
 		return gfx.EventResult{}
 	}
@@ -525,6 +589,9 @@ func (state *State) shortcut(event gfx.KeyEvent, chord keymap.Chord) gfx.EventRe
 	}
 	action := state.shortcuts.actionFor(chord)
 	if result, handled := state.sftpClipboardShortcut(event, action); handled {
+		return result
+	}
+	if result, handled := state.sftpEditorClipboardShortcut(event, action); handled {
 		return result
 	}
 	if action == shortcutNone {
@@ -567,6 +634,12 @@ func (state *State) shortcut(event gfx.KeyEvent, chord keymap.Chord) gfx.EventRe
 			return result
 		}
 		return gfx.EventResult{}
+	}
+	if action == shortcutTerminalFolder {
+		return state.openTerminalFolder(event.Target)
+	}
+	if action == shortcutDuplicateTerminal {
+		return state.duplicateTerminal(event.Target)
 	}
 	return state.executeShortcut(action)
 }
@@ -725,6 +798,16 @@ func (state *State) executeShortcut(action shortcutAction) gfx.EventResult {
 		}
 	case shortcutNewTab:
 		state.Click(hitNewTab)
+	case shortcutDuplicateTab:
+		if state.activeSection == sectionTerminal {
+			if workspace := state.deck.ActiveWorkspace(); workspace != 0 && state.duplicateTab(workspace) {
+				result.Focus = state.activeTerminalFocusHit()
+			}
+		}
+	case shortcutTerminalFolder:
+		return state.openTerminalFolder(gfx.ID{})
+	case shortcutDuplicateTerminal:
+		return state.duplicateTerminal(gfx.ID{})
 	case shortcutLocalTerminal:
 		state.openLocalTerminal()
 		result.Focus = state.activeTerminalFocusHit()
@@ -746,6 +829,8 @@ func (state *State) executeShortcut(action shortcutAction) gfx.EventResult {
 		state.Click(hitPaneSplitHorizontal)
 	case shortcutPaneSplitVertical:
 		state.Click(hitPaneSplitVertical)
+	case shortcutPaneMaximize:
+		state.Click(hitPaneMaximize)
 	case shortcutPaneClose:
 		state.Click(hitPaneClose)
 	case shortcutSFTP:
@@ -787,6 +872,14 @@ func (state *State) executeShortcut(action shortcutAction) gfx.EventResult {
 		}
 	case shortcutSettings:
 		state.openSettings()
+	case shortcutBroadcast:
+		// The command palette and the toolbar button run this same toggle, which
+		// says why a tab cannot broadcast. Outside the terminal there is no tab
+		// in view to toggle, so the key is left to whatever has the keyboard.
+		if state.activeSection != sectionTerminal {
+			return gfx.EventResult{}
+		}
+		state.toggleBroadcast()
 	}
 	return result
 }
@@ -835,4 +928,60 @@ func (state *State) pasteIntoTerminal(session *Session) {
 func (state *State) clipboardHoldsImage() bool {
 	_, err := state.options.ClipboardImagePNG()
 	return err == nil || errors.Is(err, app.ErrTooLarge)
+}
+
+func editorSelectedText(editor *text.Editor) string {
+	if editor == nil {
+		return ""
+	}
+	selection := editor.Selection()
+	if selection.Start == selection.End {
+		return ""
+	}
+	return editor.String()[editor.ByteOffset(selection.Start):editor.ByteOffset(selection.End)]
+}
+
+// sftpEditorClipboardShortcut handles copy/paste while the docked SFTP editor
+// or dialog is open, keeping non-editor panel focus from leaking to the
+// terminal command line or multi-line paste review modal.
+func (state *State) sftpEditorClipboardShortcut(event gfx.KeyEvent, action shortcutAction) (gfx.EventResult, bool) {
+	if (action != shortcutCopy && action != shortcutPaste) ||
+		state.activeSection != sectionTerminal || state.modal != modalNone || !state.filesPanelShown() {
+		return gfx.EventResult{}, false
+	}
+	session, ok := state.sessionByIDPointer(state.activeSessionID)
+	if !ok || session.files == nil || (session.files.editPath == "" && session.files.dialog == sftpDialogNone) {
+		return gfx.EventResult{}, false
+	}
+	_, target, embedded := state.decodePaneHit(event.Target)
+	if !embedded {
+		target = event.Target
+	}
+	if state.terminalSession(target) != nil || state.terminalPageSession(target) != nil {
+		return gfx.EventResult{}, false
+	}
+	if event.Repeat {
+		return gfx.EventResult{Handled: true}, true
+	}
+	if editor := state.sftpEditor(target); editor != nil && !session.files.busy {
+		if action == shortcutPaste {
+			if state.options.ClipboardText != nil {
+				value, err := state.options.ClipboardText()
+				if err == nil && value != "" {
+					if target == hitSFTPEditor {
+						value = strings.ReplaceAll(strings.ReplaceAll(value, "\r\n", "\n"), "\r", "\n")
+					} else {
+						value = text.SingleLine(value)
+					}
+					app.TextEvent{Kind: app.TextPaste, Text: value}.Apply(editor)
+					return gfx.EventResult{Handled: true, Repaint: true}, true
+				}
+			}
+			return gfx.EventResult{Handled: true}, true
+		}
+		if selected := editorSelectedText(editor); selected != "" {
+			return gfx.EventResult{Handled: true, ClipboardText: selected}, true
+		}
+	}
+	return gfx.EventResult{Handled: true}, true
 }

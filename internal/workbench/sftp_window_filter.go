@@ -20,9 +20,6 @@ func (w *sftpWindow) closeHeaderMenu() {
 }
 
 func (w *sftpWindow) targetSide(id gfx.ID) (bool, bool) {
-	if _, ok := id.In(hitSFTPProfileHoverItems); ok {
-		return true, true
-	}
 	for side := range 2 {
 		if _, ok := id.In(sftpWindowBreadcrumbs[side]); ok {
 			return side == 0, true
@@ -62,7 +59,7 @@ func (w *sftpWindow) targetSide(id gfx.ID) (bool, bool) {
 		if _, ok := id.In(sftpWindowActions[side]); ok {
 			return side == 0, true
 		}
-		for _, ids := range [][2]gfx.ID{sftpWindowPath, sftpWindowFilter, sftpWindowList, sftpWindowMore, sftpWindowFilterClear, sftpWindowFilterToggle, sftpWindowHidden, sftpWindowHeaderHidden, sftpWindowRefresh, sftpWindowUp, sftpWindowNewFolder, sftpWindowTreeBar} {
+		for _, ids := range [][2]gfx.ID{sftpWindowPath, sftpWindowFilter, sftpWindowList, sftpWindowMore, sftpWindowFilterClear, sftpWindowFilterToggle, sftpWindowHidden, sftpWindowHeaderHidden, sftpWindowRefresh, sftpWindowUp, sftpWindowNewFile, sftpWindowNewFolder, sftpWindowTreeBar} {
 			if id == ids[side] {
 				return side == 0, true
 			}
@@ -181,6 +178,7 @@ func (w *sftpWindow) headerMenuRows(side int, paneWidth float32) menuRows {
 		ID:    sftpWindowActions[side].At(sftpWindowActionIndex(hitSFTPCalculateDirectorySize)),
 		Label: m.SFTPWindow.CalculateDirectorySize, Icon: lucideIcons[iconInfo], Disabled: folder.path == "" || !local && w.view.openFiles == nil,
 	})
+	rows.add(components.ContextMenuItem{ID: sftpWindowNewFile[side], Label: m.SFTPNewFile, Icon: lucideIcons[iconFile], Disabled: busy})
 	rows.add(components.ContextMenuItem{ID: sftpWindowNewFolder[side], Label: m.SFTPNewDirectory, Icon: lucideIcons[iconFolderPlus], Disabled: busy})
 	if !local {
 		rows.add(components.ContextMenuItem{ID: hitSFTPNewLink, Label: tools.TipNewLink, Icon: lucideIcons[iconLink], Disabled: busy})
@@ -194,19 +192,21 @@ func (w *sftpWindow) headerMenuRows(side int, paneWidth float32) menuRows {
 }
 
 // declareHeaderMenus declares each pane's open More menu over the page, so its
-// backdrop covers the window bar too.
-func (w *sftpWindow) declareHeaderMenus(c ui.C, dismiss gfx.ID, anchors *[2]gfx.Rect) {
+// backdrop covers the window bar too. The menu hangs off the More button's own
+// box: the page places it from the rectangle the control is laid out at, not the
+// one the declaration can read before layout.
+func (w *sftpWindow) declareHeaderMenus(c ui.C, anchors *[2]ui.Box) {
 	for side := range 2 {
 		folder := w.folder(side == 0)
 		if !folder.headerMenuOpen {
 			continue
 		}
-		if !w.owner.sftpHeaderMenuAvailable(w.view) {
+		if !w.owner.sftpHeaderMenuAvailable(w.view) || !anchors[side].Valid() {
 			folder.headerMenuOpen = false
 			continue
 		}
 		rows := w.headerMenuRows(side, w.ui.panes[side].bounds.Width)
-		w.owner.declareMenuAt(c, &folder.headerMenuOpen, anchors[side], false, dismiss, &rows, func(id gfx.ID) {
+		w.owner.declareMenuOn(c, &folder.headerMenuOpen, anchors[side], &rows, func(id gfx.ID) {
 			w.clickFilterControl(id)
 		})
 	}

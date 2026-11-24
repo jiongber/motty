@@ -259,16 +259,21 @@ func (page *settingsPage) header(title string, searching bool) {
 		}
 		switch page.state.settingsCategory {
 		case settingsShortcuts:
-			page.headerButton(page.state.messages.ShortcutsReset, hitShortcutReset)
+			messages := page.state.messages
+			page.headerButtons(
+				components.ButtonAction{ID: hitShortcutClearAll, Label: messages.ShortcutsClearAll, Variant: components.ButtonOutline, Disabled: !page.state.shortcuts.anyBound()},
+				components.ButtonAction{ID: hitShortcutReset, Label: messages.ShortcutsReset, Variant: components.ButtonOutline},
+			)
 		}
 	})
 }
 
-// headerButton is a page-wide action in the title row. It is recorded like a
-// row's buttons, so the keyboard reaches it and the page paints it in place.
-func (page *settingsPage) headerButton(label string, id gfx.ID) {
+// headerButtons are the page-wide actions in the title row. They are recorded
+// like a row's buttons, so the keyboard reaches them and the page paints them in
+// place.
+func (page *settingsPage) headerButtons(actions ...components.ButtonAction) {
 	slot := ui.Row(page.c).Height(34).Shrink(0).Items(ui.Center).Justify(ui.End)
-	page.buttons(slot, false, components.ButtonAction{ID: id, Label: label, Variant: components.ButtonOutline})
+	page.buttons(slot, false, actions...)
 }
 
 // canvas is the page's canvas: a control paints from it and a label is measured
@@ -314,6 +319,7 @@ func (state *State) paintGeneralSettings(page *settingsPage) {
 				})
 			settingsChoiceRow(page, messages.SettingsAppearance, "", &state.appearanceMode, settingsAppearanceChoices[:], state.settingsAppearanceLabel,
 				func() { state.chooseAppearanceMode(state.appearanceMode); state.save() }, nil)
+			state.paintIconColorSetting(page)
 			page.actionRow(messages.SettingsTextSize, messages.SettingsTextSizeDescription, false,
 				components.ButtonAction{ID: hitSettingsTextSizeDown, Label: "−", Variant: components.ButtonOutline},
 				components.ButtonAction{ID: hitSettingsTextSizeReset, Label: state.interfaceTextSizeLabel(), Variant: components.ButtonGhost},
@@ -322,6 +328,8 @@ func (state *State) paintGeneralSettings(page *settingsPage) {
 				func() { state.applyTerminalToolbarPosition(); state.save() }, nil)
 			settingsChoiceRow(page, messages.SettingsTabOrientation, messages.SettingsTabOrientationDescription, &state.tabOrientation, settingsTabOrientationChoices[:], state.settingsTabOrientationLabel,
 				func() { state.applyTabOrientation(); state.save() }, nil)
+			settingsChoiceRow(page, messages.SettingsTabDoubleClick, messages.SettingsTabDoubleClickDescription, &state.tabDoubleClick, settingsTabDoubleClickChoices[:], state.settingsTabDoubleClickLabel,
+				func() { state.save() }, nil)
 			page.toggleRow(messages.SettingsTabNumbers, messages.SettingsTabNumbersDescription, state.tabNumbers, hitSettingsTabNumbers)
 			numberKey := state.tabNumberChoice()
 			settingsChoiceRow(page, messages.SettingsTabNumberKeys, messages.SettingsTabNumberKeysDescription, &numberKey, tabNumberChoices[:], state.tabNumberChoiceLabel,
@@ -342,6 +350,8 @@ func (state *State) paintGeneralSettings(page *settingsPage) {
 				settingsChoiceRow(page, messages.Tools.GeneralClose, messages.Tools.GeneralCloseDescription, &state.closeAction, settingsCloseChoices[:], state.settingsCloseLabel,
 					func() { state.save() }, nil)
 			}
+			settingsChoiceRow(page, messages.Tools.GeneralKeepWindows, messages.Tools.GeneralKeepWindowsDescription, &state.keepWindows, settingsKeepWindowsChoices[:], state.settingsKeepWindowsLabel,
+				func() { state.save() }, nil)
 			if state.options.NewWindow != nil {
 				settingsChoiceRow(page, messages.Tools.GeneralRelaunch, messages.Tools.GeneralRelaunchDescription, &state.relaunchAction, settingsRelaunchChoices[:], state.settingsRelaunchLabel,
 					func() { state.save() }, nil)
@@ -412,6 +422,7 @@ func (state *State) paintTerminalSettings(page *settingsPage) {
 			page.toggleRow(state.messages.Tools.PasteImageRow, state.messages.Tools.PasteImageDescription, !state.pasteImageOff, hitSettingsPasteImageToggle)
 			page.toggleRow(state.messages.Tools.PasteConfirmRow, state.messages.Tools.PasteConfirmDescription, !state.pasteConfirmOff, hitSettingsPasteConfirmToggle)
 			page.toggleRow(state.messages.Tools.CloseConfirmRow, state.messages.Tools.CloseConfirmDescription, !state.closeConfirmOff, hitSettingsCloseConfirmToggle)
+			page.toggleRow(state.messages.Tools.CloseWindowConfirmRow, state.messages.Tools.CloseWindowConfirmDescription, !state.closeWindowConfirmOff, hitSettingsCloseWindowConfirmToggle)
 			page.toggleRow(state.messages.Tools.PasswordHintRow, state.messages.Tools.PasswordHintDescription, !state.passwordHintOff, hitSettingsPasswordHintToggle)
 			page.toggleRow(state.messages.Tools.NotifyRow, state.messages.Tools.NotifyDescription, !state.notifyOff, hitSettingsNotifyToggle)
 			state.paintLocalStartSetting(page)
@@ -443,7 +454,9 @@ func (state *State) paintConnectionSettings(page *settingsPage) {
 			settingsChoiceRow(page, messages.SettingsNetworkProxy, messages.SettingsNetworkProxyDescription, &state.networkProxy, settingsNetworkProxyChoices[:], state.settingsNetworkProxyLabel,
 				func() { state.save() }, nil)
 			state.paintOutboundProxyRow(page)
+			state.paintSSHBrowserSetting(page)
 		})
+		state.paintProxyProfileSettings(page)
 		state.paintSSHSyncSettings(page)
 		state.paintHostTagSettings(page)
 	})
@@ -725,28 +738,11 @@ func (page *settingsPage) buttons(slot ui.Box, disabled bool, actions ...compone
 		ui.Row(c).Gap(page.state.Theme().Metrics.GapItem).Items(ui.Center).Children(func() {
 			for _, action := range actions {
 				button := ui.Button(c, action.Label).Small().Hit(action.ID, action.Label)
-				button = settingsButtonVariant(button, action.Variant)
+				button = button.Variant(action.Variant)
 				button.Disabled(disabled || action.Disabled)
 			}
 		})
 	})
-}
-
-// settingsButtonVariant dresses a page button as the variant a ButtonAction names.
-func settingsButtonVariant(button ui.Box, variant components.ButtonVariant) ui.Box {
-	switch variant {
-	case components.ButtonSecondary:
-		return button.Secondary()
-	case components.ButtonOutline:
-		return button.Outline()
-	case components.ButtonGhost:
-		return button.Ghost()
-	case components.ButtonDestructive:
-		return button.Destructive()
-	case components.ButtonDestructiveOutline:
-		return button.DestructiveOutline()
-	}
-	return button
 }
 
 // switchSlot declares a switch with the application's identity and returns it.

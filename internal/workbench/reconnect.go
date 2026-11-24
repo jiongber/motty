@@ -62,6 +62,10 @@ func reconnectTerminalError(err error) bool {
 }
 
 func (state *State) cancelReconnect(session *Session) {
+	if session.reconnectStop != nil {
+		session.reconnectStop()
+		session.reconnectStop = nil
+	}
 	if session.reconnectPending {
 		state.reconnectWaiters--
 	}
@@ -71,6 +75,7 @@ func (state *State) cancelReconnect(session *Session) {
 	session.reconnectExhausted = false
 	session.reconnectText = ""
 	session.reconnectSecond = 0
+	state.clearRevivingForwardsForSession(session.ID)
 }
 
 func (state *State) queueReconnect(session *Session) bool {
@@ -79,6 +84,10 @@ func (state *State) queueReconnect(session *Session) bool {
 	}
 	next := session.reconnectAttempt + 1
 	if !state.connectionReconnect.permits(next) {
+		if session.reconnectStop != nil {
+			session.reconnectStop()
+			session.reconnectStop = nil
+		}
 		session.reconnectPending = false
 		session.reconnectDue = 0
 		session.reconnectExhausted = session.reconnectAttempt > 0
@@ -86,14 +95,19 @@ func (state *State) queueReconnect(session *Session) bool {
 		state.recordConnectionEvent(session, connectionEventReconnectStopped, "")
 		return false
 	}
+	delay := reconnectDelay(next)
 	session.reconnectAttempt = next
-	session.reconnectDue = state.now() + reconnectDelay(next)
+	session.reconnectDue = state.now() + delay
 	session.reconnectPending = true
 	state.reconnectWaiters++
 	session.reconnectExhausted = false
 	session.reconnectText = ""
 	session.showLog = false
 	state.recordConnectionEvent(session, connectionEventReconnectWaiting, "")
+	if session.reconnectStop != nil {
+		session.reconnectStop()
+	}
+	session.reconnectStop = state.scheduleWake(delay)
 	return true
 }
 
@@ -145,6 +159,10 @@ func (state *State) advanceReconnects() {
 		if !session.reconnectPending || now < session.reconnectDue {
 			continue
 		}
+		if session.reconnectStop != nil {
+			session.reconnectStop()
+			session.reconnectStop = nil
+		}
 		session.reconnectPending = false
 		state.reconnectWaiters--
 		session.reconnectDue = 0
@@ -163,7 +181,7 @@ func (state *State) requestReconnectFrames(canvas *gfx.Canvas) {
 	}
 	// A tunnel waiting for its own retry is a waiter too, even when no tab is.
 	for _, tunnel := range state.forwardTunnels {
-		if tunnel.retryDue == 0 {
+		if !tunnel.retryPending {
 			continue
 		}
 		canvas.RequestFrameIn(max(tunnel.retryDue-now, time.Millisecond))
@@ -210,6 +228,10 @@ func (state *State) applyReconnectPolicy() {
 			continue
 		}
 		if policy == reconnectThree && session.reconnectAttempt >= 3 && session.reconnectPending {
+			if session.reconnectStop != nil {
+				session.reconnectStop()
+				session.reconnectStop = nil
+			}
 			session.reconnectPending = false
 			state.reconnectWaiters--
 			session.reconnectDue = 0
@@ -218,6 +240,10 @@ func (state *State) applyReconnectPolicy() {
 		}
 	}
 	// Forwards that waited for a retry this change took away stop now.
+	if policy == reconnectOff {
+		state.clearAllRevivingForwards()
+	}
 	state.releaseWaitingForwards()
 	state.settleForwardTunnelReconnects()
+	state.syncLinkWatch()
 }

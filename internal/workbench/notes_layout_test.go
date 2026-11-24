@@ -1,6 +1,8 @@
 package workbench
 
 import (
+	"math"
+
 	"github.com/vivaui/viva/app"
 	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/text"
@@ -34,6 +36,87 @@ func TestNotesWorkspaceGivesTheDocumentItsWidth(t *testing.T) {
 	if !ok || !titleOK || toggle.Bounds.Y+toggle.Bounds.Height/2 != title.Bounds.Y+title.Bounds.Height/2 {
 		t.Fatal("library toggle is not vertically centered beside the title")
 	}
+}
+
+func TestNotesLibraryPrimaryActionSpansAboveTheList(t *testing.T) {
+	s := newTestState(t, freshOptions(t))
+	s.Click(hitNotes)
+	s.Click(hitNoteAdd)
+	var c gfx.Canvas
+	s.Paint(&c, gfx.Size{Width: 1400, Height: 900})
+	add, ok := hitByID(&c, hitNoteAdd)
+	if !ok {
+		t.Fatal("new note action is missing")
+	}
+	if add.Role != gfx.RoleButton || add.Label != s.noteText("New note", "新建笔记") {
+		t.Fatalf("new note action lacks button semantics: %+v", add)
+	}
+	search, searchOK := hitByID(&c, hitNoteSearchToggle)
+	if !searchOK || add.Bounds.X != search.Bounds.X || add.Bounds.Width != s.notes.page.library.Pos-16 || add.Bounds.Height < 36 {
+		t.Fatalf("new note action does not span the library: width=%v action=%+v", s.notes.page.library.Pos, add.Bounds)
+	}
+	row, ok := noteTreeRowHit(&c, &s.notes, s.notes.selected)
+	if !ok || add.Bounds.Y+add.Bounds.Height > row.Bounds.Y {
+		t.Fatalf("new note action is not above the list: action=%+v row=%+v", add.Bounds, row.Bounds)
+	}
+}
+
+// With no note chosen, the editor side invites the user to pick or create one
+// rather than leaving a bare line, and an empty library says where to start.
+func TestNotesEmptyStatesInviteTheFirstNote(t *testing.T) {
+	s := newTestState(t, freshOptions(t))
+	s.Click(hitNotes)
+	var c gfx.Canvas
+	s.Paint(&c, gfx.Size{Width: 1400, Height: 900})
+	want := map[string]bool{
+		s.noteText("Start with a note", "从一篇笔记开始"):                           false,
+		s.noteText("Your first working note starts here.", "第一条工作记录，从这里开始。"): false,
+	}
+	description := false
+	for _, text := range c.Texts() {
+		if _, ok := want[text.Value]; ok {
+			want[text.Value] = true
+		}
+		description = description || strings.Contains(text.Value, s.noteText("Select a note", "从目录选择"))
+	}
+	for value, found := range want {
+		if !found {
+			t.Fatalf("empty state does not show %q", value)
+		}
+	}
+	if !description {
+		t.Fatal("empty state does not explain what to do")
+	}
+}
+
+// A note's name is centered in its tree row: the row's icon, name and action
+// button share one vertical centre.
+func TestNotesTreeTitleIsVerticallyCenteredInItsRow(t *testing.T) {
+	s := newTestState(t, testOptions(t))
+	s.notes.list = []savedNote{{ID: "centered", Title: "Centered note", Body: "body"}}
+	s.Click(hitNotes)
+	s.selectNote("centered")
+	var c gfx.Canvas
+	s.Paint(&c, gfx.Size{Width: 1400, Height: 900})
+	row, ok := noteTreeRowHit(&c, &s.notes, "centered")
+	if !ok {
+		t.Fatal("the note row is not painted")
+	}
+	for _, text := range c.Texts() {
+		if text.Value != "Centered note" {
+			continue
+		}
+		if text.Bounds.Y < row.Bounds.Y || text.Bounds.Y+text.Bounds.Height > row.Bounds.Y+row.Bounds.Height {
+			t.Fatalf("note name %+v is not inside its row %+v", text.Bounds, row.Bounds)
+		}
+		nameCenter := text.Bounds.Y + text.Bounds.Height/2
+		rowCenter := row.Bounds.Y + row.Bounds.Height/2
+		if math.Abs(float64(nameCenter-rowCenter)) > 1 {
+			t.Fatalf("note name centre %.1f is not the row centre %.1f", nameCenter, rowCenter)
+		}
+		return
+	}
+	t.Fatal("the note name is not painted")
 }
 
 func TestNotesModesAndDirectoryPreferencesSurviveReopening(t *testing.T) {

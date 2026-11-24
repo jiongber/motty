@@ -9,9 +9,8 @@ import (
 	"github.com/vivaui/viva/ui"
 )
 
-// commandsHits is the identity-tree place of the bottom command drawer, a
-// persistent strip of quick commands beside the terminal. It shares the snippet
-// list with the Snippets page, so a chip here and a row there name the same
+// commandsHits is the identity-tree place of the persistent command sidebar.
+// It shares the list with the Snippets page, so a chip and a row name the same
 // command; only the presentation and the group filter differ.
 var commandsHits = tree.Feature("commands")
 
@@ -40,15 +39,38 @@ var (
 	// hitCommandsGroupToggle names a group's checkbox in the filter; its index is
 	// the position of the group in state.commandGroups().
 	hitCommandsGroupToggle = tree.Sub(commandsHits, tree.Name("group-toggle"))
+	// hitCommandsGroupHeading names a group's heading, which opens or closes the
+	// group; its index is the group's position among the shown sections.
+	hitCommandsGroupHeading = tree.Sub(commandsHits, tree.Name("group-heading"))
 	// hitCommandsTag names a snippet's chip in the bar; its index is the
 	// snippet's index in state.snippets.list.
 	hitCommandsTag = tree.Sub(commandsHits, tree.Name("tag"))
+	// hitCommandsResize is the strip along the bar's inner edge that drags its
+	// width, the way the assistant panel's divider does.
+	hitCommandsResize = tree.ID(commandsHits, "resize")
 )
 
+// commandsPlacement is where the quick command bar lives: the strip under the
+// terminal panes, or the sidebar beside them. The zero value is the bottom bar,
+// so stored settings that predate the sidebar restore the strip the user had.
+type commandsPlacement uint8
+
 const (
-	commandsBarHeight     float32 = 34 // the single, always-visible command bar
+	commandsPlacementBottom commandsPlacement = iota
+	commandsPlacementSide
+)
+
+var commandsPlacementChoices = [...]commandsPlacement{commandsPlacementBottom, commandsPlacementSide}
+
+const (
+	commandsBarHeight     float32 = 34 // the bottom bar's own height
 	commandsChipInset     float32 = 5  // vertical inset of chips inside the bar
-	commandsDrawerPadding float32 = 8  // horizontal padding at the bar's ends
+	commandsSidebarWidth  float32 = 224
+	commandsSidebarMin    float32 = 160 // the narrowest the bar may be dragged
+	commandsMinContent    float32 = 320 // the terminals keep at least this much beside it
+	commandsHeaderHeight  float32 = 34
+	commandsChipHeight    float32 = 26
+	commandsDrawerPadding float32 = 8
 	commandsTagGap        float32 = 6
 	commandsTagPaddingX   float32 = 12
 	commandsChipRadius    float32 = 8
@@ -60,16 +82,28 @@ const (
 	commandsFilterGap     float32 = 8  // between the leading buttons and the chips
 	commandsButtonInset   float32 = 4  // hover padding around an icon button
 	commandsScrollStep    float32 = 60 // pixels a wheel notch moves the chips
+	// A group's heading: its row in the sidebar, the chevron that shows whether
+	// it is open, and the gaps that set one group apart from the next.
+	commandsHeadingHeight float32 = 22
+	commandsChevronSize   float32 = 12
+	commandsHeadingGap    float32 = 4  // between the chevron and the group's name
+	commandsSectionGap    float32 = 6  // extra space above a group in the sidebar
+	commandsSectionGapX   float32 = 14 // between one group and the next in the strip
+	commandsMaxLabelWidth float32 = 160
 )
 
-// commandsUI is the bottom command drawer's state. The single bar stays hidden
-// until shown opts it in (zero height, no bar). hiddenGroups are the
-// snippet groups (by lowercased name; "" means ungrouped) not shown in the bar,
-// and sort is the order the visible commands appear in.
+// commandsUI is the command bar's state. The bar stays hidden until shown opts
+// it in. placement is its dock: the strip under the panes or the sidebar beside
+// them. hiddenGroups are the snippet groups (by lowercased name; "" means
+// ungrouped) not shown in the bar, and sort is the order its groups and chips
+// appear in.
 type commandsUI struct {
 	// shown is whether the user opted the bar in. The zero value hides it,
 	// so a fresh install sees no bar until the picker's checkbox turns it on.
 	shown bool
+	// placement is where the bar docks while shown; the zero value is the
+	// bottom strip.
+	placement commandsPlacement
 	// filterOpen is whether the group-filter dropdown is showing.
 	filterOpen bool
 	// sortOpen is whether the order dropdown is showing.
@@ -78,15 +112,27 @@ type commandsUI struct {
 	// lowercased name; the empty key means ungrouped commands. Absent = shown.
 	// A fresh state (nil) shows every group.
 	hiddenGroups map[string]bool
+	// collapsedGroups are the groups whose heading is shown but whose commands
+	// are folded away, keyed the same way. Unlike hiddenGroups, a collapsed group
+	// stays one click from open, right where it is listed.
+	collapsedGroups map[string]bool
 	// sort is how the visible commands are ordered along the bar.
 	sort commandsSort
-	// offset is how far the chips are scrolled right; it is where the wheel puts
-	// them when more commands exist than the bar can hold.
+	// offset is how far the chips are scrolled: right on the bottom strip,
+	// down the sidebar. It is where the wheel puts them when more commands
+	// exist than the bar can hold.
 	offset float32
 	// bar is the last painted strip and maxOffset the largest offset that still
 	// shows a chip, both recorded so a wheel over the bar knows what it moves.
 	bar       gfx.Rect
 	maxOffset float32
+	// width is the width the user dragged the sidebar to; zero means the default.
+	width float32
+	// resizing is set while the inner edge is dragged, with dragFrom and
+	// dragStart recording where the gesture began so motion lands exactly.
+	resizing  bool
+	dragFrom  float32
+	dragStart float32
 }
 
 // commandsBarAvailable reports whether the active page can host the bar at all.
@@ -96,81 +142,26 @@ func (state *State) commandsBarAvailable() bool {
 		return false
 	}
 	// The bar types snippets into a terminal; a remote desktop (RDP/VNC)
-	// session has no shell to receive them, so the strip hides on those pages.
+	// session has no shell to receive them, so the sidebar hides on those pages.
 	if session, ok := state.sessionByIDPointer(state.activeSessionID); ok && session.host.isDesktop() {
 		return false
 	}
 	return true
 }
 
-// commandsDrawerHeight is the bottom space the drawer reserves, subtracted from
-// the terminal panes so they do not sit under it. Zero off the terminal page.
+// commandsDrawerHeight is the bottom space the bar reserves, subtracted from
+// the terminal panes so they do not sit under it. Zero unless the bar is shown
+// and docked at the bottom.
 func (state *State) commandsDrawerHeight() float32 {
-	if !state.commandsBarAvailable() || !state.commands.shown {
+	if !state.commandsBarAvailable() || !state.commands.shown || state.commands.placement != commandsPlacementBottom {
 		return 0
 	}
 	return commandsBarHeight
 }
 
-// commandGroupVisible reports whether a snippet's group is shown in the bar.
-func (state *State) commandGroupVisible(group string) bool {
-	return !state.commands.hiddenGroups[strings.ToLower(strings.TrimSpace(group))]
-}
-
-// commandGroups returns the distinct groups the snippets name, each in the
-// spelling of the first snippet that names it, sorted by name. hasUngrouped says
-// whether any snippet names none.
-func (state *State) commandGroups() (groups []string, hasUngrouped bool) {
-	seen := make(map[string]int)
-	for _, s := range state.snippets.list {
-		if s.Group == "" {
-			hasUngrouped = true
-			continue
-		}
-		lower := strings.ToLower(s.Group)
-		if _, ok := seen[lower]; ok {
-			continue
-		}
-		seen[lower] = len(groups)
-		groups = append(groups, s.Group)
-	}
-	sort.SliceStable(groups, func(i, j int) bool {
-		return strings.ToLower(groups[i]) < strings.ToLower(groups[j])
-	})
-	return
-}
-
-// commandDisplayOrder returns the snippet indices to show in the bar: the ones
-// whose group is visible, ordered by the chosen sort.
-func (state *State) commandDisplayOrder() []int {
-	list := state.snippets.list
-	order := make([]int, 0, len(list))
-	for i := range list {
-		if state.commandGroupVisible(list[i].Group) {
-			order = append(order, i)
-		}
-	}
-	lower := func(text string) string { return strings.ToLower(text) }
-	switch state.commands.sort {
-	case commandsSortName:
-		sort.SliceStable(order, func(a, b int) bool {
-			return lower(list[order[a]].Name) < lower(list[order[b]].Name)
-		})
-	case commandsSortGroup:
-		sort.SliceStable(order, func(a, b int) bool {
-			groupA, groupB := lower(list[order[a]].Group), lower(list[order[b]].Group)
-			if groupA != groupB {
-				return groupA < groupB
-			}
-			return lower(list[order[a]].Name) < lower(list[order[b]].Name)
-		})
-	}
-	return order
-}
-
-// commandsBarRect is where the single command bar sits: the bottom strip of the
-// active workspace, under its panes. Both the page's menus and the canvas'
-// chips are placed from it.
+// commandsBarRect is where the bottom bar sits: the lowest strip of the active
+// workspace, under its panes. Both the page's menus and the canvas' chips are
+// placed from it.
 func (state *State) commandsBarRect() gfx.Rect {
 	if state.commandsDrawerHeight() <= 0 {
 		return gfx.Rect{}
@@ -185,14 +176,327 @@ func (state *State) commandsBarRect() gfx.Rect {
 	return gfx.Rect{X: full.X, Y: frame.Y + frame.Height, Width: full.Width, Height: commandsBarHeight}
 }
 
-// paintCommandsDrawer draws the single command bar beneath the terminal panes.
-// The filter and order dropdowns are page menus, declared over it.
+// commandsPlacementLabel is the name of one dock in the picker's placement
+// control.
+func (state *State) commandsPlacementLabel(placement commandsPlacement) string {
+	if placement == commandsPlacementSide {
+		return state.messages.Tools.CommandsPlaceSide
+	}
+	return state.messages.Tools.CommandsPlaceBottom
+}
+
+// commandsSidebarExtent is the width the bar takes from the terminals: what
+// the user dragged it to, within the room the dock frame has, or the default.
+// The terminals keep their own minimum, so the bar cannot swallow the pane it
+// sits beside. Zero while the bar is docked at the bottom.
+func (state *State) commandsSidebarExtent(size gfx.Size) float32 {
+	if !state.commandsBarAvailable() || !state.commands.shown || state.commands.placement != commandsPlacementSide {
+		return 0
+	}
+	frame := state.toolbarDockFrame(size, true)
+	if frame.Width <= 0 {
+		return 0
+	}
+	least := min(commandsSidebarMin, frame.Width)
+	most := max(frame.Width-commandsMinContent, least)
+	width := state.commands.width
+	if width <= 0 {
+		width = min(commandsSidebarWidth, frame.Width*0.24)
+	}
+	return min(max(width, least), most)
+}
+
+// commandsSidebarBounds places the bar inside the dock frame, so the terminal
+// toolbar keeps the window edge and the bar sits on its inner side, as the
+// assistant panel does.
+func (state *State) commandsSidebarBounds(size gfx.Size) gfx.Rect {
+	width := state.commandsSidebarExtent(size)
+	if width <= 0 {
+		return gfx.Rect{}
+	}
+	frame := state.toolbarDockFrame(size, true)
+	return gfx.Rect{
+		X: frame.X + frame.Width - width, Y: windowBarHeight,
+		Width: width, Height: max(size.Height-windowBarHeight, 0),
+	}
+}
+
+// commandGroupKey is how a snippet's group is told apart from another's: groups
+// are the same when they differ only in case or surrounding space around "/",
+// and the empty key is the ungrouped commands.
+func commandGroupKey(group string) string {
+	return strings.ToLower(normalizeSnippetGroupPath(group))
+}
+
+// commandGroupVisible reports whether a snippet's group (and every ancestor
+// folder in its path) is shown in the bar.
+func (state *State) commandGroupVisible(group string) bool {
+	if len(state.commands.hiddenGroups) == 0 {
+		return true
+	}
+	key := commandGroupKey(group)
+	if key == "" {
+		return !state.commands.hiddenGroups[""]
+	}
+	for path := key; path != ""; path = snippetGroupParent(path) {
+		if state.commands.hiddenGroups[path] {
+			return false
+		}
+	}
+	return true
+}
+
+// toggleCommandGroupVisible flips a group (and its subtree) in the bar's group
+// filter. Hiding a parent hides its descendants; showing a child inside a
+// hidden parent expands that ancestor's hidden state onto its other siblings so
+// only the chosen branch becomes visible.
+func (state *State) toggleCommandGroupVisible(group string) {
+	key := commandGroupKey(group)
+	if key == "" {
+		return
+	}
+	if state.commands.hiddenGroups == nil {
+		state.commands.hiddenGroups = make(map[string]bool)
+	}
+	if state.commandGroupVisible(group) {
+		state.commands.hiddenGroups[key] = true
+		for existing := range state.commands.hiddenGroups {
+			if existing != "" && existing != key && snippetGroupWithin(existing, key) {
+				delete(state.commands.hiddenGroups, existing)
+			}
+		}
+		return
+	}
+	var ancestors []string
+	for parent := snippetGroupParent(key); parent != ""; parent = snippetGroupParent(parent) {
+		ancestors = append(ancestors, parent)
+	}
+	groups, _ := state.commandGroups()
+	splitting := false
+	for i := len(ancestors) - 1; i >= 0; i-- {
+		ancestor := ancestors[i]
+		if state.commands.hiddenGroups[ancestor] {
+			delete(state.commands.hiddenGroups, ancestor)
+			splitting = true
+		}
+		if !splitting {
+			continue
+		}
+		keepBranch := key
+		if i > 0 {
+			keepBranch = ancestors[i-1]
+		}
+		for _, candidate := range groups {
+			ckey := commandGroupKey(candidate)
+			if snippetGroupParent(ckey) == ancestor && ckey != keepBranch {
+				state.commands.hiddenGroups[ckey] = true
+			}
+		}
+	}
+	for existing := range state.commands.hiddenGroups {
+		if existing != "" && snippetGroupWithin(existing, key) {
+			delete(state.commands.hiddenGroups, existing)
+		}
+	}
+}
+
+// commandGroups returns the distinct groups the snippets name (plus every
+// ancestor folder in their slash-separated paths), each in the spelling of the
+// first snippet that introduces it, sorted in pre-order tree order.
+// hasUngrouped says whether any snippet names none.
+func (state *State) commandGroups() (groups []string, hasUngrouped bool) {
+	seen := make(map[string]bool)
+	add := func(group string) {
+		group = normalizeSnippetGroupPath(group)
+		if group == "" {
+			return
+		}
+		lower := strings.ToLower(group)
+		if seen[lower] {
+			return
+		}
+		seen[lower] = true
+		groups = append(groups, group)
+	}
+	for _, s := range state.snippets.list {
+		if s.Group == "" {
+			hasUngrouped = true
+			continue
+		}
+		add(s.Group)
+	}
+	for index := 0; index < len(groups); index++ {
+		for parent := snippetGroupParent(groups[index]); parent != ""; parent = snippetGroupParent(parent) {
+			add(parent)
+		}
+	}
+	sort.SliceStable(groups, func(i, j int) bool {
+		return snippetGroupLess(groups[i], groups[j])
+	})
+	return
+}
+
+// commandSection is one group of the bar: its heading and the snippets listed
+// under it, as indices into state.snippets.list.
+type commandSection struct {
+	// key is the group's commandGroupKey; "" is the ungrouped commands.
+	key string
+	// label is the heading: the leaf folder name in the spelling of its first
+	// snippet, or the language's word for ungrouped.
+	label string
+	// depth is the folder nesting level (0 for top-level and ungrouped).
+	depth uint8
+	// collapsed hides the commands (and any descendant groups) and leaves the
+	// heading.
+	collapsed bool
+	// ancestorCollapsed is true when an ancestor folder is collapsed, hiding
+	// this section and its commands from view.
+	ancestorCollapsed bool
+	items             []int
+}
+
+func commandSectionAncestorCollapsed(collapsed map[string]bool, key string) bool {
+	if len(collapsed) == 0 || key == "" {
+		return false
+	}
+	for parent := snippetGroupParent(key); parent != ""; parent = snippetGroupParent(parent) {
+		if collapsed[parent] {
+			return true
+		}
+	}
+	return false
+}
+
+// commandSectionOrderLess orders two named sections in pre-order tree order,
+// using firstSeen at the first differing sibling so child groups always stay
+// nested under their parent even in creation order.
+func commandSectionOrderLess(left, right string, firstSeen map[string]int) bool {
+	lpath, rpath := left, right
+	for {
+		l, lrest, lmore := strings.Cut(left, "/")
+		r, rrest, rmore := strings.Cut(right, "/")
+		if l != r {
+			lp, rp := lpath, rpath
+			if lmore {
+				lp = lpath[:len(lpath)-len(lrest)-1]
+			}
+			if rmore {
+				rp = rpath[:len(rpath)-len(rrest)-1]
+			}
+			if lo, ro := firstSeen[lp], firstSeen[rp]; lo != ro {
+				return lo < ro
+			}
+			return snippetGroupLess(left, right)
+		}
+		if !lmore || !rmore {
+			return !lmore && rmore
+		}
+		left, right = lrest, rrest
+	}
+}
+
+// commandSections groups the snippets the filter lets through, in the order the
+// bar shows them. Nested slash-separated paths materialize their ancestor
+// folders in pre-order tree order; a group's place and its commands' order
+// follow the chosen sort. Ungrouped commands always come last, so the named
+// groups stay at the top where they are looked for.
+func (state *State) commandSections() []commandSection {
+	list := state.snippets.list
+	sections := make([]commandSection, 0, 4)
+	at := make(map[string]int)
+	firstSeen := make(map[string]int)
+	ensure := func(path string, order int) int {
+		key := commandGroupKey(path)
+		if n, ok := at[key]; ok {
+			return n
+		}
+		n := len(sections)
+		at[key] = n
+		firstSeen[key] = order
+		label := snippetGroupLeaf(path)
+		if key == "" {
+			label = state.messages.Tools.CommandsUngrouped
+		}
+		sections = append(sections, commandSection{
+			key:               key,
+			label:             label,
+			depth:             snippetGroupDepth(key),
+			collapsed:         state.commands.collapsedGroups[key],
+			ancestorCollapsed: commandSectionAncestorCollapsed(state.commands.collapsedGroups, key),
+		})
+		return n
+	}
+	for i := range list {
+		if !state.commandGroupVisible(list[i].Group) {
+			continue
+		}
+		path := normalizeSnippetGroupPath(list[i].Group)
+		if path != "" {
+			var ancestors []string
+			for parent := snippetGroupParent(path); parent != ""; parent = snippetGroupParent(parent) {
+				ancestors = append(ancestors, parent)
+			}
+			for j := len(ancestors) - 1; j >= 0; j-- {
+				ensure(ancestors[j], i)
+			}
+		}
+		n := ensure(path, i)
+		sections[n].items = append(sections[n].items, i)
+	}
+	byName := state.commands.sort != commandsSortCreated
+	sort.SliceStable(sections, func(a, b int) bool {
+		if (sections[a].key == "") != (sections[b].key == "") {
+			return sections[b].key == ""
+		}
+		if byName {
+			return snippetGroupLess(sections[a].key, sections[b].key)
+		}
+		return commandSectionOrderLess(sections[a].key, sections[b].key, firstSeen)
+	})
+	if state.commands.sort == commandsSortName {
+		for i := range sections {
+			items := sections[i].items
+			sort.SliceStable(items, func(a, b int) bool {
+				return strings.ToLower(list[items[a]].Name) < strings.ToLower(list[items[b]].Name)
+			})
+		}
+	}
+	return sections
+}
+
+// commandSectionsGrouped reports whether the bar shows group headings. Commands
+// that all lack a group form one section that needs no name, so a list nobody
+// has grouped keeps looking like a plain row of buttons.
+func commandSectionsGrouped(sections []commandSection) bool {
+	return len(sections) > 1 || len(sections) == 1 && sections[0].key != ""
+}
+
+// commandDisplayOrder returns the snippet indices the bar lists, in the order it
+// lists them: the sections one after another, folded groups included.
+func (state *State) commandDisplayOrder() []int {
+	order := make([]int, 0, len(state.snippets.list))
+	for _, section := range state.commandSections() {
+		order = append(order, section.items...)
+	}
+	return order
+}
+
+// paintCommandsDrawer draws the quick command bar where the user docked it.
 func (state *State) paintCommandsDrawer(canvas *gfx.Canvas) {
+	if state.commands.placement == commandsPlacementSide {
+		state.paintCommandsSidebar(canvas)
+		return
+	}
+	state.paintCommandsBar(canvas)
+}
+
+// paintCommandsBar draws the bottom strip of quick commands under the panes.
+func (state *State) paintCommandsBar(canvas *gfx.Canvas) {
 	bar := state.commandsBarRect()
 	state.commands.bar = bar
+	// Nothing is painted, so a wheel must not think the old strip is there.
+	state.commands.maxOffset = 0
 	if bar.Width <= 0 {
-		// Nothing is painted, so a wheel must not think the old strip is there.
-		state.commands.maxOffset = 0
 		return
 	}
 	// A faint fill and a top hairline set the strip apart from the terminal.
@@ -239,7 +543,73 @@ func (state *State) paintCommandsDrawer(canvas *gfx.Canvas) {
 	contentX := sortBtn.X + sortBtn.Width + commandsButtonInset + commandsFilterGap
 	contentW := addX - commandsFilterGap - contentX
 	if contentW > 0 {
-		state.paintCommandChips(canvas, bar, contentX, contentW)
+		state.paintCommandChipsBar(canvas, bar, contentX, contentW)
+	}
+}
+
+// paintCommandsSidebar draws the sidebar beside the terminal panes.
+func (state *State) paintCommandsSidebar(canvas *gfx.Canvas) {
+	bar := state.commandsSidebarBounds(state.viewport)
+	state.commands.bar = bar
+	state.commands.maxOffset = 0
+	if bar.Width <= 0 || bar.Height <= 0 {
+		return
+	}
+	canvas.Fill(bar, withAlpha(state.pal.shell, 0.6))
+	canvas.Fill(gfx.Rect{X: bar.X, Y: bar.Y, Width: 1, Height: bar.Height}, state.pal.line)
+
+	m := state.messages.Tools
+	// The inner edge drags the bar's width. The strip is wider than the line it
+	// sits on, so it is easy to grab without moving anything until it is pulled.
+	if state.commands.resizing || canvas.Hovered() == hitCommandsResize {
+		canvas.Fill(gfx.Rect{X: bar.X, Y: bar.Y, Width: 1, Height: bar.Height}, state.pal.accent)
+	}
+	canvas.HitWithOptions(hitCommandsResize, gfx.Rect{X: bar.X, Y: bar.Y, Width: 8, Height: bar.Height}, m.CommandsResize, gfx.HitOptions{Cursor: gfx.PointerCursorResizeHorizontal})
+	iconColor := state.pal.muted
+	cy := bar.Y + (commandsHeaderHeight-commandsIconSize)/2
+
+	closeX := bar.X + bar.Width - commandsDrawerPadding - commandsIconSize
+	addX := closeX - commandsButtonGap - commandsIconSize
+	sortX := addX - commandsLeadGap - commandsIconSize
+	filterX := sortX - commandsLeadGap - commandsIconSize
+	title := gfx.Rect{X: bar.X + commandsDrawerPadding, Y: bar.Y, Width: filterX - bar.X - commandsDrawerPadding - commandsFilterGap, Height: commandsHeaderHeight}
+	if title.Width > 24 {
+		canvas.Label(m.SnippetsTitle, title, gfx.TextStyle{Size: state.Theme().Metrics.FontSizeS, Weight: gfx.WeightMedium, Color: state.pal.text})
+	}
+
+	filterBtn := gfx.Rect{X: filterX, Y: cy, Width: commandsIconSize, Height: commandsIconSize}
+	filterActive := state.commands.filterOpen || len(state.commands.hiddenGroups) > 0
+	state.paintCommandsLeadButton(canvas, filterBtn, hitCommandsFilter, iconSliders, m.CommandsFilter, filterActive)
+
+	// Order button right beside it, lit the same way while its menu is open or a
+	// non-default order is in effect.
+	sortBtn := gfx.Rect{X: sortX, Y: cy, Width: commandsIconSize, Height: commandsIconSize}
+	sortActive := state.commands.sortOpen || state.commands.sort != commandsSortCreated
+	state.paintCommandsLeadButton(canvas, sortBtn, hitCommandsSort, iconArrowUpDown, m.CommandsSortRow, sortActive)
+
+	// Add (+) and close (×) grouped together on the right; each lifts or reddens
+	// on hover so the pair reads as controls.
+	add := gfx.Rect{X: addX, Y: cy, Width: commandsIconSize, Height: commandsIconSize}
+	addColor := iconColor
+	if canvas.Hovered() == hitCommandsAdd {
+		addColor = state.pal.text
+	}
+	canvas.DrawIcon(lucideIcons[iconPlus], add, addColor)
+	canvas.HitWithOptions(hitCommandsAdd, add, m.CommandsAdd, gfx.HitOptions{Role: gfx.RoleButton})
+	closeBtn := gfx.Rect{X: closeX, Y: cy, Width: commandsIconSize, Height: commandsIconSize}
+	closeColor := iconColor
+	if canvas.Hovered() == hitCommandsClose {
+		closeColor = state.pal.danger
+	}
+	canvas.DrawIcon(lucideIcons[iconClose], closeBtn, closeColor)
+	canvas.HitWithOptions(hitCommandsClose, closeBtn, m.CommandsClose, gfx.HitOptions{Role: gfx.RoleButton})
+
+	list := gfx.Rect{
+		X: bar.X + commandsDrawerPadding, Y: bar.Y + commandsHeaderHeight,
+		Width: bar.Width - commandsDrawerPadding*2, Height: bar.Height - commandsHeaderHeight - commandsDrawerPadding,
+	}
+	if list.Width > 0 && list.Height > 0 {
+		state.paintCommandChips(canvas, list)
 	}
 }
 
@@ -265,42 +635,175 @@ func (state *State) paintCommandsLeadButton(canvas *gfx.Canvas, rect gfx.Rect, i
 	canvas.HitWithOptions(id, rect, hint, gfx.HitOptions{Role: gfx.RoleButton})
 }
 
-// paintCommandChips draws the visible commands in the strip's middle. More
-// commands than fit scroll sideways with the wheel, so a long list stays
-// reachable without widening the bar; the clip keeps a half-scrolled chip from
-// running under the buttons at either end.
-func (state *State) paintCommandChips(canvas *gfx.Canvas, bar gfx.Rect, x, width float32) {
-	order := state.commandDisplayOrder()
+// paintCommandChips draws the scrollable list below the sidebar header: each
+// group's heading, then its commands one to a row. A folded group shows only its
+// heading.
+func (state *State) paintCommandChips(canvas *gfx.Canvas, bounds gfx.Rect) {
+	sections := state.commandSections()
+	if len(sections) == 0 {
+		state.commands.offset = 0
+		return
+	}
+	grouped := commandSectionsGrouped(sections)
+	// Lay the rows out twice: once to learn how far the list scrolls, once to
+	// paint what the scroll leaves in view.
+	extent := state.layoutCommandRows(sections, grouped, nil)
+	state.commands.maxOffset = max(extent-bounds.Height, 0)
+	state.commands.offset = min(max(state.commands.offset, 0), state.commands.maxOffset)
+	canvas.Clip(bounds)
+	state.layoutCommandRows(sections, grouped, func(section, index int, top, height float32) {
+		y := bounds.Y + top - state.commands.offset
+		if y >= bounds.Y+bounds.Height || y+height <= bounds.Y {
+			return
+		}
+		indent := float32(min(int(sections[section].depth), 6)) * 12
+		rect := gfx.Rect{X: bounds.X + indent, Y: y, Width: max(bounds.Width-indent, 40), Height: height}
+		if index < 0 {
+			state.paintCommandHeading(canvas, rect, sections[section], hitCommandsGroupHeading.At(section), true)
+			return
+		}
+		id := hitCommandsTag.At(index)
+		state.paintCommandTag(canvas, rect, state.snippets.list[index], id)
+		state.openSnippetBarMenuOn(canvas, id, index)
+	})
+	canvas.Unclip()
+}
+
+// layoutCommandRows walks the sidebar's rows top to bottom and returns the
+// height they add up to. visit, when given, is called for each row with its
+// section, the snippet index (-1 for the group's heading), its top within the list
+// and its height.
+func (state *State) layoutCommandRows(sections []commandSection, grouped bool, visit func(section, index int, top, height float32)) float32 {
+	y := float32(0)
+	shown := 0
+	for si, section := range sections {
+		if grouped && section.ancestorCollapsed {
+			continue
+		}
+		if grouped {
+			if shown > 0 && section.depth == 0 {
+				y += commandsSectionGap
+			}
+			if visit != nil {
+				visit(si, -1, y, commandsHeadingHeight)
+			}
+			y += commandsHeadingHeight + commandsTagGap
+			shown++
+		}
+		if grouped && section.collapsed {
+			continue
+		}
+		for _, index := range section.items {
+			if visit != nil {
+				visit(si, index, y, commandsChipHeight)
+			}
+			y += commandsChipHeight + commandsTagGap
+		}
+	}
+	return max(y-commandsTagGap, 0)
+}
+
+// paintCommandHeading draws a group's heading: a chevron that says whether its
+// commands are listed, and the group's name. Clicking it folds or unfolds the
+// group. The sidebar heading spans the row; the strip's is only as wide as its
+// text.
+func (state *State) paintCommandHeading(canvas *gfx.Canvas, rect gfx.Rect, section commandSection, id gfx.ID, hoverFill bool) {
+	theme := state.Theme()
+	color := state.pal.muted
+	if canvas.Hovered() == id {
+		color = state.pal.text
+		if hoverFill {
+			canvas.Rounded(rect, 6, withAlpha(state.pal.surfaceHot, 0.6))
+		}
+	}
+	icon, hint := iconChevronDown, state.messages.Tools.CommandsCollapse
+	if section.collapsed {
+		icon, hint = iconChevronRight, state.messages.Tools.CommandsExpand
+	}
+	chevron := gfx.Rect{X: rect.X + 2, Y: rect.Y + (rect.Height-commandsChevronSize)/2, Width: commandsChevronSize, Height: commandsChevronSize}
+	canvas.DrawIcon(lucideIcons[icon], chevron, color)
+	textX := chevron.X + commandsChevronSize + commandsHeadingGap
+	label := gfx.Rect{X: textX, Y: rect.Y, Width: max(rect.X+rect.Width-textX, 0), Height: rect.Height}
+	canvas.Label(section.label, label, gfx.TextStyle{Size: theme.Metrics.FontSizeS, Weight: gfx.WeightMedium, Color: color})
+	canvas.HitWithOptions(id, rect, section.label, gfx.HitOptions{Role: gfx.RoleButton, Hint: hint})
+}
+
+// commandHeadingWidth is the strip heading's width: chevron, gap and name.
+func (state *State) commandHeadingWidth(canvas *gfx.Canvas, label string) float32 {
+	text := canvas.TextWidthWeight(label, state.Theme().Metrics.FontSizeS, gfx.WeightMedium)
+	return min(commandsMaxLabelWidth, text+2+commandsChevronSize+commandsHeadingGap+2)
+}
+
+// paintCommandChipsBar draws the visible commands in the bottom strip's middle,
+// each group's name followed by its commands. More than fit scroll sideways with
+// the wheel, so a long list stays reachable without widening the bar; the clip
+// keeps a half-scrolled chip from running under the buttons at either end.
+func (state *State) paintCommandChipsBar(canvas *gfx.Canvas, bar gfx.Rect, x, width float32) {
+	sections := state.commandSections()
+	grouped := commandSectionsGrouped(sections)
 	chipH := commandsBarHeight - commandsChipInset*2
 	y := bar.Y + commandsChipInset
-	extent := float32(0)
-	for i, index := range order {
-		if i > 0 {
-			extent += commandsTagGap
-		}
-		extent += state.commandTagWidth(canvas, state.snippets.list[index].Name)
-	}
+	extent := state.layoutCommandStrip(canvas, sections, grouped, nil)
 	maxOffset := max(extent-width, 0)
 	state.commands.maxOffset = maxOffset
 	state.commands.offset = min(max(state.commands.offset, 0), maxOffset)
-	if len(order) == 0 {
+	if len(sections) == 0 {
 		return
 	}
 	canvas.Clip(gfx.Rect{X: x, Y: bar.Y, Width: width, Height: bar.Height})
-	x0 := x - state.commands.offset
-	for _, index := range order {
-		w := state.commandTagWidth(canvas, state.snippets.list[index].Name)
-		if x0+w > x && x0 < x+width {
-			id := hitCommandsTag.At(index)
-			state.paintCommandTag(canvas, gfx.Rect{X: x0, Y: y, Width: w, Height: chipH}, state.snippets.list[index].Name, id)
-			state.openSnippetBarMenuOn(canvas, id, index)
+	state.layoutCommandStrip(canvas, sections, grouped, func(section, index int, left, w float32) {
+		left += x - state.commands.offset
+		if left+w <= x || left >= x+width {
+			return
 		}
-		x0 += w + commandsTagGap
-		if x0 >= x+width {
-			break
+		if index < 0 {
+			state.paintCommandHeading(canvas, gfx.Rect{X: left, Y: y, Width: w, Height: chipH}, sections[section], hitCommandsGroupHeading.At(section), false)
+			return
+		}
+		id := hitCommandsTag.At(index)
+		state.paintCommandTag(canvas, gfx.Rect{X: left, Y: y, Width: w, Height: chipH}, state.snippets.list[index], id)
+		state.openSnippetBarMenuOn(canvas, id, index)
+	})
+	canvas.Unclip()
+}
+
+// layoutCommandStrip walks the strip's items left to right and returns the width
+// they add up to; visit receives each with its left edge and width, the way
+// layoutCommandRows does for the sidebar.
+func (state *State) layoutCommandStrip(canvas *gfx.Canvas, sections []commandSection, grouped bool, visit func(section, index int, left, width float32)) float32 {
+	x := float32(0)
+	shown := 0
+	for si, section := range sections {
+		if grouped && section.ancestorCollapsed {
+			continue
+		}
+		if shown > 0 {
+			x += commandsSectionGapX
+		}
+		if grouped {
+			w := state.commandHeadingWidth(canvas, section.label)
+			if visit != nil {
+				visit(si, -1, x, w)
+			}
+			x += w + commandsTagGap
+			shown++
+		}
+		if grouped && (section.collapsed || len(section.items) == 0) {
+			x -= commandsTagGap
+			continue
+		}
+		for i, index := range section.items {
+			if i > 0 {
+				x += commandsTagGap
+			}
+			w := state.commandTagWidth(canvas, state.snippets.list[index].Name)
+			if visit != nil {
+				visit(si, index, x, w)
+			}
+			x += w
 		}
 	}
-	canvas.Unclip()
+	return x
 }
 
 // commandsMenuWidth fits a dropdown to its longest row: group names and order
@@ -326,27 +829,54 @@ func commandsMenuHeading(label string) components.DropdownMenuItem {
 // bar itself is still painted by the window; the menu is an overlay of the
 // page, so its rows keep the page's own hit, focus and keyboard behaviour.
 func (state *State) declareCommandsMenus(c ui.C) {
-	bar := state.commandsBarRect()
+	if state.commands.placement == commandsPlacementBottom {
+		bar := state.commandsBarRect()
+		if bar.Width <= 0 {
+			return
+		}
+		state.commands.bar = bar
+		cy := bar.Y + (commandsBarHeight-commandsIconSize)/2
+		filterButton := gfx.Rect{X: bar.X + commandsDrawerPadding, Y: cy, Width: commandsIconSize, Height: commandsIconSize}
+		sortButton := gfx.Rect{X: filterButton.X + filterButton.Width + commandsLeadGap, Y: cy, Width: commandsIconSize, Height: commandsIconSize}
+		if state.commands.filterOpen {
+			state.declareCommandsFilterMenu(c, bar, filterButton)
+		}
+		if state.commands.sortOpen {
+			state.declareCommandsSortMenu(c, bar, sortButton)
+		}
+		return
+	}
+	bar := state.commandsSidebarBounds(state.viewport)
 	if bar.Width <= 0 {
 		return
 	}
-	state.commands.bar = bar
-	cy := bar.Y + (commandsBarHeight-commandsIconSize)/2
-	filterButton := gfx.Rect{X: bar.X + commandsDrawerPadding, Y: cy, Width: commandsIconSize, Height: commandsIconSize}
-	sortButton := gfx.Rect{X: filterButton.X + filterButton.Width + commandsLeadGap, Y: cy, Width: commandsIconSize, Height: commandsIconSize}
+	cy := bar.Y + (commandsHeaderHeight-commandsIconSize)/2
+	closeX := bar.X + bar.Width - commandsDrawerPadding - commandsIconSize
+	addX := closeX - commandsButtonGap - commandsIconSize
+	sortX := addX - commandsLeadGap - commandsIconSize
+	filterX := sortX - commandsLeadGap - commandsIconSize
 	if state.commands.filterOpen {
-		state.declareCommandsFilterMenu(c, bar, filterButton)
+		state.declareCommandsFilterMenu(c, bar, gfx.Rect{X: filterX, Y: cy, Width: commandsIconSize, Height: commandsIconSize})
 	}
 	if state.commands.sortOpen {
-		state.declareCommandsSortMenu(c, bar, sortButton)
+		state.declareCommandsSortMenu(c, bar, gfx.Rect{X: sortX, Y: cy, Width: commandsIconSize, Height: commandsIconSize})
 	}
 }
 
-// declareCommandsMenu anchors an open dropdown above the bar, level with its
-// trigger's hover pill, at the width its labels asked for, and declares its
-// rows. ui.Menu opens 4px over its anchor; the bar's menus have always kept 6px
-// from the strip, so the zero-size anchor sits 2px above the bar's top.
+// declareCommandsMenu places a menu beside the sidebar header or above the
+// bottom bar, depending on where the bar is docked, and declares its rows.
 func (state *State) declareCommandsMenu(c ui.C, bar, trigger gfx.Rect, open *bool, width float32, rows func(*ui.MenuItems)) {
+	if state.commands.placement == commandsPlacementSide {
+		width = min(width, max(0, bar.X-18))
+		anchor := gfx.Rect{X: bar.X - width - 6, Y: bar.Y + commandsHeaderHeight}
+		ui.MenuAt(c, open, anchor, func(menu *ui.MenuItems) {
+			menu.WidthRange(width, width)
+			rows(menu)
+		})
+		return
+	}
+	// ui.Menu opens 4px over its anchor; the bar's menus have always kept 6px
+	// from the strip, so the zero-size anchor sits 2px above the bar's top.
 	viewport := state.windowRect()
 	x := max(12, trigger.X-4)
 	if x+width > viewport.Width-12 {
@@ -375,8 +905,9 @@ func (state *State) declareCommandsFilterMenu(c ui.C, bar, trigger gfx.Rect) {
 		})
 	}
 	for i, g := range groups {
+		label := strings.Repeat("  ", min(int(snippetGroupDepth(g)), 6)) + snippetGroupLeaf(g)
 		choices = append(choices, components.DropdownMenuItem{
-			ID: hitCommandsGroupToggle.At(i), Label: g,
+			ID: hitCommandsGroupToggle.At(i), Label: label,
 			Kind: components.DropdownMenuCheckbox, Checked: state.commandGroupVisible(g),
 		})
 	}
@@ -448,27 +979,42 @@ func (state *State) declareCommandsSortMenu(c ui.C, bar, trigger gfx.Rect) {
 	})
 }
 
-// scrollCommandsBar moves the chips under a wheel that turns over the bar. A
-// horizontal delta is the user's own sideways gesture; a plain wheel turns its
-// vertical notches into the same sideways move, the way a tab strip does.
+// scrollCommandsBar moves the chips under a wheel that turns over the bar: to
+// the side on the bottom strip, down the sidebar.
 func (state *State) scrollCommandsBar(event gfx.ScrollEvent) (gfx.EventResult, bool) {
-	if state.commandsDrawerHeight() <= 0 || state.commands.maxOffset <= 0 ||
+	if !state.commandsBarAvailable() || !state.commands.shown || state.commands.maxOffset <= 0 ||
 		state.commands.filterOpen || state.commands.sortOpen ||
 		!pointInRect(event.X, event.Y, state.commands.bar) {
 		return gfx.EventResult{}, false
 	}
-	delta := event.StepX(commandsScrollStep)
+	delta := event.StepY(commandsScrollStep)
+	if state.commands.placement == commandsPlacementBottom {
+		// A horizontal delta is the user's own sideways gesture; a plain wheel
+		// turns its vertical notches into the same sideways move, the way a tab
+		// strip does.
+		if horizontal := event.StepX(commandsScrollStep); horizontal != 0 {
+			delta = horizontal
+		}
+	}
 	if delta == 0 {
-		delta = event.StepY(commandsScrollStep)
+		return gfx.EventResult{}, false
 	}
 	before := state.commands.offset
 	state.commands.offset = min(max(before+delta, 0), state.commands.maxOffset)
 	return gfx.EventResult{Handled: true, Repaint: state.commands.offset != before}, true
 }
 
+// commandTagWidth measures a bottom bar tag's width from its label, clamped to
+// sensible bounds.
+func (state *State) commandTagWidth(canvas *gfx.Canvas, name string) float32 {
+	theme := state.Theme()
+	w := canvas.TextWidthWeight(name, theme.Metrics.FontSizeS, gfx.WeightMedium) + commandsTagPaddingX*2
+	return max(commandsMinTagWidth, min(commandsMaxTagWidth, w))
+}
+
 // paintCommandTag draws one command chip: a rounded, bordered pill that sends on
 // click. A hovered chip lifts to an accent tint so the pointer's target is clear.
-func (state *State) paintCommandTag(canvas *gfx.Canvas, rect gfx.Rect, name string, id gfx.ID) {
+func (state *State) paintCommandTag(canvas *gfx.Canvas, rect gfx.Rect, entry snippet, id gfx.ID) {
 	theme := state.Theme()
 	fill := state.pal.surfaceHot
 	border := withAlpha(state.pal.line, 0.9)
@@ -478,15 +1024,8 @@ func (state *State) paintCommandTag(canvas *gfx.Canvas, rect gfx.Rect, name stri
 	}
 	canvas.RoundedBorder(rect, commandsChipRadius, 1, border, fill)
 	label := gfx.Rect{X: rect.X + commandsTagPaddingX, Y: rect.Y, Width: rect.Width - commandsTagPaddingX*2, Height: rect.Height}
-	canvas.Label(name, label, gfx.TextStyle{Size: theme.Metrics.FontSizeS, Weight: gfx.WeightMedium, Color: state.pal.text})
-	canvas.HitWithOptions(id, rect, name, gfx.HitOptions{Role: gfx.RoleButton})
-}
-
-// commandTagWidth measures a tag's width from its label, clamped to sensible bounds.
-func (state *State) commandTagWidth(canvas *gfx.Canvas, name string) float32 {
-	theme := state.Theme()
-	w := canvas.TextWidthWeight(name, theme.Metrics.FontSizeS, gfx.WeightMedium) + commandsTagPaddingX*2
-	return max(commandsMinTagWidth, min(commandsMaxTagWidth, w))
+	canvas.Label(entry.Name, label, gfx.TextStyle{Size: theme.Metrics.FontSizeS, Weight: gfx.WeightMedium, Color: state.pal.text})
+	canvas.HitWithOptions(id, rect, entry.Name, gfx.HitOptions{Role: gfx.RoleButton, Hint: entry.Command})
 }
 
 // commandBarSwitchShown reports whether the picker's chrome offers the bar's
@@ -510,11 +1049,34 @@ func (state *State) toggleCommandBarFromPicker() {
 	state.save()
 }
 
-// clickCommandsDrawer dispatches a click in the bottom command drawer. It returns
-// false when the id is not one of the drawer's, so the central handler can try
-// the next candidate.
+// setCommandsPlacement docks the bar at the bottom strip or beside the panes.
+// A dock change ends any menu or drag that belonged to the old shape, and the
+// chips start from the beginning again because the room they have changed.
+func (state *State) setCommandsPlacement(placement commandsPlacement) {
+	previous := state.commands.placement
+	state.commands.placement = placement
+	state.commandsPlacementChanged(previous)
+}
+
+// commandsPlacementChanged is what follows the picker's dock control, which has
+// already written state.commands.placement: only a real change resets the
+// menus, drag and chip offset the old dock had.
+func (state *State) commandsPlacementChanged(previous commandsPlacement) {
+	if state.commands.placement == previous {
+		return
+	}
+	state.commands.offset = 0
+	state.commands.filterOpen = false
+	state.commands.sortOpen = false
+	state.commands.resizing = false
+	state.save()
+}
+
+// clickCommandsDrawer dispatches a click in the command bar. It returns false
+// when the id is not one of the bar's, so the central handler can try the next
+// candidate.
 func (state *State) clickCommandsDrawer(id gfx.ID) bool {
-	if !state.terminalPage() || state.modal != modalNone {
+	if !state.commandsBarAvailable() || !state.commands.shown || state.modal != modalNone {
 		return false
 	}
 	switch {
@@ -543,13 +1105,33 @@ func (state *State) clickCommandsDrawer(id gfx.ID) bool {
 		state.commands.hiddenGroups = hidden
 		state.save()
 	case id == hitCommandsGroupUngrouped:
-		state.commands.hiddenGroups[""] = !state.commands.hiddenGroups[""]
+		if state.commands.hiddenGroups[""] {
+			delete(state.commands.hiddenGroups, "")
+		} else {
+			if state.commands.hiddenGroups == nil {
+				state.commands.hiddenGroups = make(map[string]bool)
+			}
+			state.commands.hiddenGroups[""] = true
+		}
 		state.save()
 	case id.Scope() == hitCommandsGroupToggle:
 		groups, _ := state.commandGroups()
 		if index := item(id); index >= 0 && index < len(groups) {
-			key := strings.ToLower(groups[index])
-			state.commands.hiddenGroups[key] = !state.commands.hiddenGroups[key]
+			state.toggleCommandGroupVisible(groups[index])
+			state.save()
+		}
+	case id.Scope() == hitCommandsGroupHeading:
+		sections := state.commandSections()
+		if index := item(id); index >= 0 && index < len(sections) {
+			key := sections[index].key
+			if state.commands.collapsedGroups[key] {
+				delete(state.commands.collapsedGroups, key)
+			} else {
+				if state.commands.collapsedGroups == nil {
+					state.commands.collapsedGroups = make(map[string]bool)
+				}
+				state.commands.collapsedGroups[key] = true
+			}
 			state.save()
 		}
 	case id.Scope() == hitCommandsTag:
@@ -572,4 +1154,48 @@ func (state *State) clickCommandsDrawer(id gfx.ID) bool {
 		return false
 	}
 	return true
+}
+
+// commandsDrawerResize drags the bar's inner edge. It stores the width the
+// user leaves and refits the terminals while the drag runs, so the panes follow
+// the pointer instead of jumping when it is released.
+func (state *State) commandsDrawerResize(event gfx.PointerEvent) gfx.EventResult {
+	commands := &state.commands
+	// A press elsewhere ends a gesture whose release the window never saw, and
+	// is then handled normally.
+	if event.Kind == gfx.PointerDown && event.Target != hitCommandsResize {
+		commands.resizing = false
+	}
+	if !state.commandsBarAvailable() || !commands.shown || commands.placement != commandsPlacementSide || state.modal != modalNone {
+		return gfx.EventResult{}
+	}
+	if event.Kind == gfx.PointerDown && event.Target == hitCommandsResize && event.Button == gfx.PointerButtonPrimary {
+		if bar := state.commandsSidebarBounds(event.Viewport); bar.Width > 0 {
+			commands.resizing = true
+			commands.dragFrom, commands.dragStart = event.X, bar.Width
+			return gfx.EventResult{Handled: true, Repaint: true}
+		}
+		return gfx.EventResult{}
+	}
+	if !commands.resizing {
+		return gfx.EventResult{}
+	}
+	switch event.Kind {
+	case gfx.PointerMove, gfx.PointerUp:
+		frame := state.toolbarDockFrame(event.Viewport, true)
+		least := min(commandsSidebarMin, frame.Width)
+		most := max(frame.Width-commandsMinContent, least)
+		width := min(max(commands.dragStart+commands.dragFrom-event.X, least), most)
+		if width != commands.width {
+			commands.width = width
+			state.fitTerminals()
+		}
+	case gfx.PointerExit:
+		commands.resizing = false
+	}
+	if event.Kind == gfx.PointerUp {
+		commands.resizing = false
+		state.save()
+	}
+	return gfx.EventResult{Handled: true, Repaint: true}
 }

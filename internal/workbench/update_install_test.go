@@ -23,6 +23,7 @@ type fakeUpdater struct {
 	reason      selfupdate.Reason
 	packageType update.Package
 	prepare     func(ctx context.Context, progress func(selfupdate.Progress), phase func(selfupdate.Phase)) (selfupdate.Staged, error)
+	launch      func(staged selfupdate.Staged, quit func()) error
 	launched    int
 	failure     string
 }
@@ -37,10 +38,14 @@ func (updater *fakeUpdater) Prepare(ctx context.Context, _ update.Release, progr
 	return selfupdate.Staged{Version: "99.0.0"}, nil
 }
 
-func (updater *fakeUpdater) Launch(selfupdate.Staged, func()) error {
+func (updater *fakeUpdater) Launch(staged selfupdate.Staged, quit func()) error {
 	updater.mu.Lock()
-	defer updater.mu.Unlock()
 	updater.launched++
+	launch := updater.launch
+	updater.mu.Unlock()
+	if launch != nil {
+		return launch(staged, quit)
+	}
 	return nil
 }
 
@@ -103,6 +108,58 @@ func TestAnUpdateThatCanBeInstalledIsInstalledAndTheApplicationQuits(t *testing.
 	waitUpdate(t, state, func() bool { return quits == 1 })
 	if updater.launches() != 1 || state.update.install.phase != installRestarting || len(opened) != 0 {
 		t.Fatalf("launched %d, phase %d, opened %q", updater.launches(), state.update.install.phase, opened)
+	}
+}
+
+// The download being over, the dialog says the release is being prepared and
+// then installed, not downloaded or checked; and a cancel clicked once the
+// installer has started cannot stop a replacement that is already under way.
+func TestTheDialogSaysWhatTheUpdateIsDoingAfterTheDownload(t *testing.T) {
+	updater, quits, opened := &fakeUpdater{}, 0, []string(nil)
+	prepared, continuePrepare := make(chan struct{}), make(chan struct{})
+	updater.prepare = func(_ context.Context, progress func(selfupdate.Progress), phase func(selfupdate.Phase)) (selfupdate.Staged, error) {
+		phase(selfupdate.PhaseDownloading)
+		progress(selfupdate.Progress{Done: 10, Size: 10})
+		phase(selfupdate.PhaseVerifying)
+		close(prepared)
+		<-continuePrepare
+		return selfupdate.Staged{Version: "99.0.0"}, nil
+	}
+	running, releaseInstall := make(chan struct{}), make(chan struct{})
+	updater.launch = func(selfupdate.Staged, func()) error {
+		close(running)
+		<-releaseInstall
+		return nil
+	}
+	state := updateWindow(t, updater, &quits, &opened)
+	m := state.messages.Tools
+	state.Click(hitUpdateInstall)
+	<-prepared
+	waitUpdate(t, state, func() bool { return state.update.install.phase == installVerifying })
+	_, texts := paintedTexts(state)
+	if !contains(texts, fmt.Sprintf(m.UpdateInstallingTitleFmt, "99.0.0")) || !contains(texts, m.UpdateVerifying) {
+		t.Fatalf("preparing the update still reads as the download: %q", texts)
+	}
+	if contains(texts, fmt.Sprintf(m.UpdateDownloadingTitleFmt, "99.0.0")) {
+		t.Fatalf("the download is over but the title says it is running: %q", texts)
+	}
+	close(continuePrepare)
+	waitUpdate(t, state, func() bool { return state.update.install.phase == installInstalling })
+	<-running
+	_, texts = paintedTexts(state)
+	if !contains(texts, m.UpdateInstalling) || contains(texts, m.UpdateVerifying) {
+		t.Fatalf("the install does not say it is installing: %q", texts)
+	}
+	// The installer has started: cancelling now would only lose the dialog.
+	state.Click(hitUpdateProgressCancel)
+	waitUpdate(t, state, func() bool { return true })
+	if state.modal != modalUpdateProgress || state.update.install.phase != installInstalling {
+		t.Fatalf("cancel stopped an install that had started: modal %d, phase %d", state.modal, state.update.install.phase)
+	}
+	close(releaseInstall)
+	waitUpdate(t, state, func() bool { return quits == 1 })
+	if updater.launches() != 1 || len(opened) != 0 {
+		t.Fatalf("launched %d, opened %q", updater.launches(), opened)
 	}
 }
 
@@ -458,5 +515,133 @@ func TestUpdateNotesDragDoesNotSurviveReopen(t *testing.T) {
 
 	if state.modal != modalUpdate || notes.dragging {
 		t.Fatalf("reopened update dialog retained an old drag: modal %v, notes %+v", state.modal, notes)
+	}
+}
+
+func TestSwitchingUpdateSourceInDialogKeepsDialogAndChecks(t *testing.T) {
+	updater, quits, opened := &fakeUpdater{}, 0, []string(nil)
+	release1 := offeredRelease
+	release2 := update.Release{Version: "0.0.1"}
+	checkSource := update.SourceOfficial
+
+	_, options := newWorld(t)
+	options.Invalidate = func() {}
+	options.CheckUpdate = func() (update.Release, error) {
+		if checkSource == update.SourceOfficial {
+			return release1, nil
+		}
+		return release2, nil
+	}
+	options.Updater = updater
+	options.Quit = func() { quits++ }
+	options.OpenURL = func(url string) error { opened = append(opened, url); return nil }
+	state := newTestState(t, options)
+	state.Click(hitSettingsUpdateCheck)
+	waitUpdate(t, state, func() bool { return state.modal == modalUpdate })
+
+	// Initial state: release1 is shown in dialog
+	_, texts := paintedTexts(state)
+	if !contains(texts, fmt.Sprintf(state.messages.Tools.UpdateDialogTitleFmt, release1.Version)) {
+		t.Fatalf("dialog does not show release 1: %q", texts)
+	}
+
+	// Switch update source to CNB
+	checkSource = update.SourceCNB
+	state.update.source = update.SourceCNB
+	state.changeUpdateSource()
+
+	// Dialog MUST NOT close: it stays in modalUpdate
+	if state.modal != modalUpdate {
+		t.Fatalf("modal was closed on changing update source: %v", state.modal)
+	}
+
+	// Once check finishes, it reports latest version
+	waitUpdate(t, state, func() bool { return !state.update.checking })
+	if state.modal != modalUpdate {
+		t.Fatalf("modal was closed after checking finished: %v", state.modal)
+	}
+	if state.update.available {
+		t.Fatalf("update should not be available for CNB: %+v", state.update)
+	}
+	_, texts = paintedTexts(state)
+	latestMsg := fmt.Sprintf(state.messages.Tools.UpdateLatestFmt, update.Current)
+	if !contains(texts, latestMsg) {
+		t.Fatalf("dialog does not show latest version message %q: %q", latestMsg, texts)
+	}
+	if !contains(texts, state.messages.LabelWindowClose) {
+		t.Fatalf("dialog does not offer close button: %q", texts)
+	}
+
+	// Switch back to official source which has an update
+	checkSource = update.SourceOfficial
+	state.update.source = update.SourceOfficial
+	state.changeUpdateSource()
+
+	if state.modal != modalUpdate {
+		t.Fatalf("modal was closed on switching back: %v", state.modal)
+	}
+	waitUpdate(t, state, func() bool { return !state.update.checking && state.update.available })
+	if state.modal != modalUpdate {
+		t.Fatalf("modal was closed when update became available: %v", state.modal)
+	}
+	_, texts = paintedTexts(state)
+	if !contains(texts, fmt.Sprintf(state.messages.Tools.UpdateDialogTitleFmt, release1.Version)) {
+		t.Fatalf("dialog does not show release 1 after switching back: %q", texts)
+	}
+	if !contains(texts, state.messages.Tools.UpdateInstall) {
+		t.Fatalf("dialog does not offer install button: %q", texts)
+	}
+
+	// Clicking install directly triggers install
+	state.Click(hitUpdateInstall)
+	waitUpdate(t, state, func() bool { return quits == 1 })
+	if updater.launches() != 1 {
+		t.Fatalf("updater was not launched: %d", updater.launches())
+	}
+}
+
+func TestSwitchingUpdateSourceShowsCheckingState(t *testing.T) {
+	updater := &fakeUpdater{}
+	gate := make(chan struct{})
+	defer close(gate)
+
+	_, options := newWorld(t)
+	options.Invalidate = func() {}
+	options.CheckUpdate = func() (update.Release, error) {
+		<-gate
+		return offeredRelease, nil
+	}
+	options.Updater = updater
+	state := newTestState(t, options)
+	state.modal = modalUpdate
+	state.update.available = true
+	state.update.release = offeredRelease
+
+	// Change source
+	state.update.source = update.SourceCNB
+	state.changeUpdateSource()
+
+	if state.modal != modalUpdate {
+		t.Fatalf("modal closed: %v", state.modal)
+	}
+	if !state.update.checking {
+		t.Fatalf("state is not checking: %+v", state.update)
+	}
+
+	_, texts := paintedTexts(state)
+	if !contains(texts, state.messages.Tools.UpdateChecking) {
+		t.Fatalf("checking text not painted: %q", texts)
+	}
+	if !contains(texts, state.messages.Cancel) {
+		t.Fatalf("cancel button not painted: %q", texts)
+	}
+
+	// User cancels while checking
+	state.Click(hitUpdateLater)
+	if state.modal != modalNone {
+		t.Fatalf("modal not closed on cancel: %v", state.modal)
+	}
+	if state.update.checking {
+		t.Fatalf("checking not reset on cancel: %+v", state.update)
 	}
 }

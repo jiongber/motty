@@ -125,6 +125,7 @@ func (state *State) syncSFTPSearch(view *sftpView, folder *sftpFolder) {
 	}
 	if search != nil && search.query != query {
 		search.match(query)
+		state.loadTypeIcons(view, search.rows)
 		folder.first, folder.scrollOffset, folder.wheel = 0, 0, 0
 	}
 	folder.syncSearchList()
@@ -257,7 +258,9 @@ func (state *State) handSearch(view *sftpView, folder *sftpFolder, search *sftpS
 		if folder.search != search {
 			return
 		}
+		before := len(search.rows)
 		search.add(items)
+		state.loadTypeIcons(view, search.rows[before:])
 		if done {
 			search.running, search.summary, search.failure = false, summary, failure
 		}
@@ -295,7 +298,7 @@ func (search *sftpSearch) matchItem(item *sftpSearchItem) {
 		return
 	}
 	start, end, _ := sftpFilterMatch(item.name, search.query)
-	icon, mono := sftpFileIcon(item.name, item.mode)
+	icon, mono := sftpFileIcon(sftpclient.Entry{Name: item.name, Mode: item.mode})
 	search.rows = append(search.rows, sftpRow{
 		entry: sftpclient.Entry{Name: item.name, Mode: item.mode}, icon: icon, mono: mono,
 		matchStart: start, matchEnd: end, where: item.dir,

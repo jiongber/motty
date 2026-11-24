@@ -20,10 +20,11 @@ type forwardTunnel struct {
 	// at that point.
 	connected bool
 	// retryAttempt counts automatic retries after a lost connection, and
-	// retryDue is when the next dial is made. A zero retryDue means no retry is
-	// waiting.
+	// retryPending/retryDue track when the next dial is made.
 	retryAttempt int
+	retryPending bool
 	retryDue     time.Duration
+	retryStop    func()
 	closed       bool
 }
 
@@ -80,6 +81,11 @@ func (state *State) dialForwardTunnel(tunnel *forwardTunnel) {
 	session.hostKey, session.err = sshconn.HostKeyInfo{}, nil
 	session.endpoint = sshconn.Endpoint{Host: tunnel.host.Address, Port: tunnel.host.Port, User: state.login(tunnel.host)}
 	tunnel.connected = false
+	if tunnel.retryStop != nil {
+		tunnel.retryStop()
+		tunnel.retryStop = nil
+	}
+	tunnel.retryPending = false
 	tunnel.retryDue = 0
 	if !tunnel.host.isSSH() || tunnel.host.mosh() {
 		state.failForwardTunnel(tunnel, errors.New(state.messages.ForwardHostUnavailable))
@@ -100,7 +106,7 @@ func (state *State) pumpForwardTunnels() {
 	now := state.now()
 	for index := 0; index < len(state.forwardTunnels); {
 		tunnel := state.forwardTunnels[index]
-		if tunnel.retryDue != 0 && now >= tunnel.retryDue {
+		if tunnel.retryPending && now >= tunnel.retryDue {
 			state.dialForwardTunnel(tunnel)
 			if tunnel.closed {
 				// The dial was refused outright: the tunnel removed itself, and
@@ -204,14 +210,22 @@ func (state *State) failForwardTunnel(tunnel *forwardTunnel, err error) {
 		if !tunnel.connected && err != nil {
 			lastError = err.Error()
 		}
+		revive := forward.Resume && retryable && state.connectionReconnect != reconnectOff
 		forward.stop()
 		forward.lastError = lastError
+		forward.reviveTunnel = revive
 		forward.refresh(state.messages, state.forwardHostAvailable(*forward))
 	}
 	if waiting > 0 {
 		tunnel.retryAttempt++
-		tunnel.retryDue = state.now() + reconnectDelay(tunnel.retryAttempt)
+		delay := reconnectDelay(tunnel.retryAttempt)
+		tunnel.retryPending = true
+		tunnel.retryDue = state.now() + delay
 		tunnel.connected = false
+		if tunnel.retryStop != nil {
+			tunnel.retryStop()
+		}
+		tunnel.retryStop = state.scheduleWake(delay)
 		if tunnel.session.conn != nil {
 			tunnel.session.conn.Cancel()
 			tunnel.session.conn = nil
@@ -227,14 +241,16 @@ func (state *State) failForwardTunnel(tunnel *forwardTunnel, err error) {
 
 // abandonForwardTunnel stops the forwards of a tunnel that will not be retried,
 // as when the reconnect setting is turned off while it waits.
-func (state *State) abandonForwardTunnel(tunnel *forwardTunnel) {
+func (state *State) abandonForwardTunnel(tunnel *forwardTunnel, revivable bool) {
 	for index := range state.forwards {
 		forward := &state.forwards[index]
 		if forward.sessionID != tunnel.id {
 			continue
 		}
+		revive := revivable && forward.Resume
 		forward.stop()
 		forward.lastError = state.messages.ForwardConnectionClosed
+		forward.reviveTunnel = revive
 		forward.refresh(state.messages, state.forwardHostAvailable(*forward))
 	}
 	state.closeForwardTunnel(tunnel)
@@ -265,6 +281,11 @@ func (state *State) closeForwardTunnel(tunnel *forwardTunnel) {
 	}
 	tunnel.closed = true
 	tunnel.connected = false
+	if tunnel.retryStop != nil {
+		tunnel.retryStop()
+		tunnel.retryStop = nil
+	}
+	tunnel.retryPending = false
 	tunnel.retryDue = 0
 	if tunnel.session.conn != nil {
 		tunnel.session.conn.Cancel()
@@ -294,13 +315,16 @@ func (state *State) closeForwardTunnels() {
 func (state *State) settleForwardTunnelReconnects() {
 	for index := 0; index < len(state.forwardTunnels); {
 		tunnel := state.forwardTunnels[index]
-		if tunnel.retryDue == 0 {
+		if !tunnel.retryPending {
 			index++
 			continue
 		}
-		if state.connectionReconnect == reconnectOff ||
-			state.connectionReconnect == reconnectThree && tunnel.retryAttempt >= 3 {
-			state.abandonForwardTunnel(tunnel)
+		if state.connectionReconnect == reconnectOff {
+			state.abandonForwardTunnel(tunnel, false)
+			continue
+		}
+		if state.connectionReconnect == reconnectThree && tunnel.retryAttempt >= 3 {
+			state.abandonForwardTunnel(tunnel, true)
 			continue
 		}
 		index++

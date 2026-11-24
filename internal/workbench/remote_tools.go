@@ -67,6 +67,9 @@ const (
 	remoteMaxRows            = 200
 	remoteTimeout            = 20 * time.Second
 	remoteToolbarHeight      = float32(34)
+	// remoteToolsInlineToolbarWidth is how wide the tools' content must be for
+	// the tabs and the refresh controls to share one line.
+	remoteToolsInlineToolbarWidth = 800
 )
 
 // clickRemoteToolsOpen opens the dialog for the active session.
@@ -125,6 +128,7 @@ func (state *State) applyRemoteTab() {
 	view.resetScroll = true
 	view.procs, view.containers, view.compose, view.resources = nil, nil, nil, nil
 	view.collectedAt, view.stale, view.snapshotStatus = time.Time{}, false, ""
+	view.containerUsage, view.containerUsageError = nil, ""
 	view.processesTruncated, view.commandsTruncated = false, false
 	state.rebuildRemoteRows()
 	if view.noDocker && view.tab != remoteProcesses {
@@ -150,9 +154,13 @@ func (tab remoteTab) kind() (remotetools.Kind, bool) {
 	return 0, false
 }
 
+// remoteMaxColumns is the widest table's column count: the process table keeps
+// six, and the container table adds CPU and memory to its five.
+const remoteMaxColumns = 7
+
 // remoteRow is one entry of either table, as the cells the table paints.
 type remoteRow struct {
-	cells [6]string
+	cells [remoteMaxColumns]string
 	// key identifies the entry across refreshes: the process number or the
 	// container's ID.
 	key         string
@@ -176,11 +184,13 @@ type remoteToolsView struct {
 
 	procs                  []remotetools.Process
 	containers             []remotetools.Container
+	containerUsage         map[string]remotetools.ContainerUsage
+	containerUsageError    string
 	compose                []remotetools.ComposeProject
 	resources              []remotetools.Resource
 	rows                   []remoteRow
 	selected               string
-	processColumns         [6]components.TableColumn
+	processColumns         [remoteMaxColumns]components.TableColumn
 	searches               [6]remoteSearch
 	processDetails         remoteProcessDetails
 	processDetailsSerial   uint64
@@ -207,13 +217,18 @@ type remoteToolsView struct {
 	paintTab remoteTab
 	// tableColumns, tableHeadings, tableHeaderCells and tableCount are what the
 	// current declaration fitted, so the header paint and row cells share them.
-	tableColumns     [6]components.TableColumn
-	tableHeadings    [6]string
-	tableHeaderCells [6]components.TableHeader
+	tableColumns     [remoteMaxColumns]components.TableColumn
+	tableHeadings    [remoteMaxColumns]string
+	tableHeaderCells [remoteMaxColumns]components.TableHeader
 	tableCount       int
 	tableRowHeight   float32
 	tableScroll      *ui.ScrollState
 	resetScroll      bool
+	// columnWidths points at the workbench's chosen widths for each tab. The
+	// dialog and every content window share them, so closing and reopening a
+	// surface keeps the sizes for the session.
+	columnWidths *[6]remoteTableColumnWidths
+	columnResize remoteTableColumnResize
 	// menuRow and rowMenuAt are the row a secondary press opened the context
 	// menu for; rowMenuOpen is the menu's own dismissal state.
 	menuRow     int
@@ -255,7 +270,7 @@ type remoteToolsView struct {
 	// been read again.
 	note    string
 	failed  bool
-	columns [6]string
+	columns [remoteMaxColumns]string
 }
 
 func (state *State) remoteToolsOffered(session *Session) bool {
@@ -282,6 +297,7 @@ func (state *State) openRemoteToolsTab(session *Session, tab remoteTab, switchTa
 	state.cancelRemoteProcessCommand()
 	state.cancelRemoteProcessEnvironment()
 	state.cancelRemoteContainerEnvironment()
+	state.cancelRemoteContainerInspect()
 	state.remote = remoteToolsView{
 		session: session.ID, title: session.Title, tab: tab, sort: state.remote.sort,
 		serial: state.remote.serial + 1, processDetailsSerial: detailsSerial,
@@ -667,6 +683,8 @@ func (state *State) refreshRemoteTools() {
 			containers []remotetools.Container
 			compose    []remotetools.ComposeProject
 			resources  []remotetools.Resource
+			usages     []remotetools.ContainerUsage
+			usageErr   error
 			err        error
 		)
 		if kind, isResource := tab.kind(); isResource {
@@ -678,6 +696,9 @@ func (state *State) refreshRemoteTools() {
 			procs = snapshot.Processes
 		} else {
 			containers, err = remotetools.Containers(ctx, runner)
+			if err == nil {
+				usages, usageErr = remotetools.ContainerUsages(ctx, runner)
+			}
 		}
 		collectedAt := time.Now()
 		state.postRemoteToolsUpdate(func(state *State) {
@@ -698,6 +719,13 @@ func (state *State) refreshRemoteTools() {
 			}
 			view.collectedAt, view.stale = collectedAt, false
 			view.procs, view.containers, view.compose, view.resources = procs, containers, compose, resources
+			view.containerUsage, view.containerUsageError = nil, ""
+			if tab == remoteContainers {
+				view.containerUsage = mergeContainerUsage(containers, usages)
+				if usageErr != nil {
+					view.containerUsageError = state.remoteErrorText(usageErr)
+				}
+			}
 			view.processesTruncated, view.commandsTruncated = snapshot.Truncated, snapshot.CommandsTruncated
 			state.updateRemoteSnapshotStatus()
 			state.rebuildRemoteRows()
@@ -720,6 +748,9 @@ func (state *State) refreshRemoteTools() {
 				view.status = empty
 			default:
 				view.status = fmt.Sprintf(m.RemoteLoadedFmt, len(view.rows))
+			}
+			if view.containerUsageError != "" && view.sourceTotal > 0 {
+				view.status += " · " + fmt.Sprintf(m.RemoteContainerUsageFailedFmt, view.containerUsageError)
 			}
 			if view.note != "" {
 				view.status, view.note = view.note+" "+view.status, ""
@@ -860,14 +891,14 @@ func (state *State) rebuildRemoteRows() {
 	view.rows = view.rows[:0]
 	if view.tab == remoteProcesses {
 		for _, process := range view.procs {
-			view.rows = append(view.rows, remoteRow{key: remotetools.ProcessKey(process), cells: [6]string{
+			view.rows = append(view.rows, remoteRow{key: remotetools.ProcessKey(process), cells: [remoteMaxColumns]string{
 				strconv.Itoa(process.PID), process.User, strconv.FormatFloat(process.CPU, 'f', 1, 64),
 				strconv.FormatFloat(process.Memory, 'f', 1, 64), process.Elapsed, process.Command,
 			}})
 		}
 	} else if view.tab == remoteCompose {
 		for _, project := range view.compose {
-			row := remoteRow{key: project.Name, cells: [6]string{project.Name, project.Status, project.ConfigFiles}}
+			row := remoteRow{key: project.Name, cells: [remoteMaxColumns]string{project.Name, project.Status, project.ConfigFiles}}
 			row.config = project.ConfigFileList()
 			if len(row.config) > remoteComposeConfigLimit {
 				row.config, row.configMore = row.config[:remoteComposeConfigLimit], true
@@ -882,8 +913,13 @@ func (state *State) rebuildRemoteRows() {
 		}
 	} else {
 		for _, container := range view.containers {
-			view.rows = append(view.rows, remoteRow{key: container.ID, cells: [6]string{
-				container.Name, container.Image, container.State, container.Status, container.ID,
+			cpu, memory := "—", "—"
+			if usage, ok := view.containerUsage[container.ID]; ok {
+				cpu = formatContainerCPU(usage.CPUPercent)
+				memory = usage.MemoryUsed + " / " + usage.MemoryLimit
+			}
+			view.rows = append(view.rows, remoteRow{key: container.ID, cells: [remoteMaxColumns]string{
+				container.Name, container.Image, cpu, memory, container.State, container.ID, container.Status,
 			}})
 		}
 	}
@@ -938,4 +974,42 @@ func (state *State) remoteToolActions() (actions [8]components.ButtonAction, cou
 		actions[i].Disabled = actions[i].Disabled || processBlocked
 	}
 	return actions, count
+}
+
+// mergeContainerUsage keys one docker stats sample by the container ID the
+// listing uses. docker prints the same short ID as ps, but the match accepts
+// either side being the truncated form so a daemon that prints longer IDs
+// still joins its figures to the right row.
+func mergeContainerUsage(
+	containers []remotetools.Container,
+	usages []remotetools.ContainerUsage,
+) map[string]remotetools.ContainerUsage {
+	if len(containers) == 0 || len(usages) == 0 {
+		return nil
+	}
+	merged := make(map[string]remotetools.ContainerUsage, min(len(containers), len(usages)))
+	for _, usage := range usages {
+		for _, container := range containers {
+			if containerIDsMatch(container.ID, usage.ID) {
+				merged[container.ID] = usage
+				break
+			}
+		}
+	}
+	return merged
+}
+
+func containerIDsMatch(a, b string) bool {
+	return strings.HasPrefix(a, b) || strings.HasPrefix(b, a)
+}
+
+// formatContainerCPU prints docker stats' CPU figure without its percent sign,
+// so the sortable column reads as one number, as the process table's does.
+func formatContainerCPU(percent float64) string {
+	return strconv.FormatFloat(percent, 'f', 2, 64)
+}
+
+// containerPercent is the figure as docker stats prints it, with its sign.
+func containerPercent(percent float64) string {
+	return formatContainerCPU(percent) + "%"
 }

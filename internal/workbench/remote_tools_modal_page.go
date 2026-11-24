@@ -91,23 +91,21 @@ func (state *State) ensureRemoteToolsModalControls() {
 func (state *State) declareRemoteToolsBody(c ui.C) {
 	view := &state.remote
 	tab := view.tab
-	stacked := c.Bounds().Width < 800
-	ui.Column(c).Fill().Children(func() {
-		ui.Row(c).Height(remoteToolbarHeight).Shrink(0).Gap(12).Children(func() {
-			if ui.Choice(c, &view.tab, remoteTabChoices[:], view.tabLabel).Width(600).Shrink(1).FillHeight().Changed() {
-				state.applyRemoteTab()
-			}
-			ui.Spacer(c)
-			if !stacked {
-				state.declareRemoteRefreshControls(c)
-			}
-		})
-		if stacked {
-			ui.Row(c).Height(remoteToolbarHeight).Shrink(0).MarginSides(8, 0, 0, 0).Children(func() {
+	ui.Container(c).Fill().Children(func() {
+		// The tabs and the refresh controls share a line once the dialog's body
+		// is wide enough for both; a narrower body puts the controls on a line
+		// of their own under the tabs.
+		ui.Column(c).Shrink(0).Gap(8).From(ui.Width(remoteToolsInlineToolbarWidth), func(b ui.Box) { b.Row().Gap(12) }).Children(func() {
+			ui.Row(c).Height(remoteToolbarHeight).Grow(1).Shrink(1).Children(func() {
+				if ui.Choice(c, &view.tab, remoteTabChoices[:], view.tabLabel).Width(600).Shrink(1).FillHeight().Changed() {
+					state.applyRemoteTab()
+				}
+			})
+			ui.Row(c).Height(remoteToolbarHeight).Shrink(0).Children(func() {
 				ui.Spacer(c)
 				state.declareRemoteRefreshControls(c)
 			})
-		}
+		})
 		state.declareRemoteToolsSearch(c)
 		state.declareRemoteTable(c)
 		state.declareRemoteToolsStatus(c, tab)
@@ -175,7 +173,8 @@ func (state *State) declareRemoteToolsSearch(c ui.C) {
 func (state *State) declareRemoteTable(c ui.C) {
 	view, theme := &state.remote, state.Theme()
 	padding := theme.Metrics.PadSurface + theme.Metrics.GapItem
-	fallback := remoteToolsModalWidth - 2*padding - remoteToolsTableMargin
+	width := max(min(remoteToolsModalWidth, dialogViewport(c).Width-32), 0)
+	fallback := width - 2*padding - remoteToolsTableMargin - 2
 	view.ctx = c
 	state.declareRemoteToolsTable(c, view.tab, fallback)
 }
@@ -213,14 +212,7 @@ func (state *State) declareRemoteToolActions(c ui.C) {
 	for index := 0; index < count; index++ {
 		action := actions[index]
 		button := ui.Button(c, action.Label).Shrink(0)
-		switch action.Variant {
-		case components.ButtonDestructive:
-			button = button.Destructive()
-		case components.ButtonSecondary:
-			button = button.Secondary()
-		default:
-			button = button.Outline()
-		}
+		button = button.Variant(remoteToolsVariant(action.Variant))
 		if action.Disabled {
 			button = button.Disabled(true)
 		}
@@ -234,28 +226,56 @@ func (state *State) declareRemoteToolActions(c ui.C) {
 // objectTableSchema is the Docker table's columns and headings by tab. It
 // fills the view's own column storage, so a paint neither allocates the schema
 // nor loses it before the rows are declared.
-func (state *State) objectTableSchema(tab remoteTab) ([]components.TableColumn, []string) {
+func (state *State) objectTableSchema(tab remoteTab, width float32) ([]components.TableColumn, []string) {
 	m, view := state.messages.Tools, &state.remote
 	switch tab {
 	case remoteCompose:
-		view.columns = [6]string{m.RemoteColName, m.RemoteColStatus, m.RemoteColConfig}
-		view.processColumns = [6]components.TableColumn{{Width: 220}, {Width: 200}, {Width: 0}}
+		view.columns = [remoteMaxColumns]string{m.RemoteColName, m.RemoteColStatus, m.RemoteColConfig}
+		view.processColumns = [remoteMaxColumns]components.TableColumn{{Width: 220}, {Width: 200}, {Width: 0}}
 		return view.processColumns[:3], view.columns[:3]
 	case remoteImages:
-		view.columns = [6]string{m.RemoteColName, m.RemoteColID, m.RemoteColSize, m.RemoteColCreated}
-		view.processColumns = [6]components.TableColumn{{Width: 470}, {Width: 150}, {Width: 100, Alignment: components.TableAlignRight}, {Width: 0}}
+		view.columns = [remoteMaxColumns]string{m.RemoteColName, m.RemoteColID, m.RemoteColSize, m.RemoteColCreated}
+		view.processColumns = [remoteMaxColumns]components.TableColumn{{Width: 470}, {Width: 150}, {Width: 100, Alignment: components.TableAlignRight}, {Width: 0}}
 		return view.processColumns[:4], view.columns[:4]
 	case remoteVolumes:
-		view.columns = [6]string{m.RemoteColName, m.RemoteColDriver, m.RemoteColScope}
-		view.processColumns = [6]components.TableColumn{{Width: 470}, {Width: 150}, {Width: 0}}
+		view.columns = [remoteMaxColumns]string{m.RemoteColName, m.RemoteColDriver, m.RemoteColScope}
+		view.processColumns = [remoteMaxColumns]components.TableColumn{{Width: 470}, {Width: 150}, {Width: 0}}
 		return view.processColumns[:3], view.columns[:3]
 	case remoteNetworks:
-		view.columns = [6]string{m.RemoteColName, m.RemoteColID, m.RemoteColDriver, m.RemoteColScope}
-		view.processColumns = [6]components.TableColumn{{Width: 300}, {Width: 160}, {Width: 150}, {Width: 0}}
+		view.columns = [remoteMaxColumns]string{m.RemoteColName, m.RemoteColID, m.RemoteColDriver, m.RemoteColScope}
+		view.processColumns = [remoteMaxColumns]components.TableColumn{{Width: 300}, {Width: 160}, {Width: 150}, {Width: 0}}
 		return view.processColumns[:4], view.columns[:4]
 	default:
-		view.columns = [6]string{m.RemoteColName, m.RemoteColImage, m.RemoteColState, m.RemoteColStatus, m.RemoteColID}
-		view.processColumns = [6]components.TableColumn{{Width: 200}, {Width: 220}, {Width: 90}, {Width: 200}, {Width: 0}}
-		return view.processColumns[:5], view.columns[:5]
+		// Docker's CPU and memory figures sit beside the image, as they do in
+		// docker stats. The status line takes the room a wide window leaves:
+		// it is the only value whose length varies a lot, while the ID is
+		// always twelve characters.
+		view.columns = [remoteMaxColumns]string{
+			m.RemoteColName, m.RemoteColImage, m.RemoteColCPU, m.RemoteColContainerMemory,
+			m.RemoteColState, m.RemoteColID, m.RemoteColStatus,
+		}
+		view.processColumns = [remoteMaxColumns]components.TableColumn{
+			{Width: 160}, {Width: 150}, {Width: 80, Alignment: components.TableAlignRight},
+			{Width: 160, Alignment: components.TableAlignRight}, {Width: 80}, {Width: 120}, {Width: 0},
+		}
+		const fixed = 160 + 150 + 80 + 160 + 80 + 120
+		if width < fixed+120 {
+			scale := min(max(width-120, 1)/fixed, 1)
+			for index := range view.processColumns[:6] {
+				view.processColumns[index].Width *= scale
+			}
+		}
+		return view.processColumns[:7], view.columns[:7]
 	}
+}
+
+// remoteToolsVariant is the look of a remote tool's action: a destructive or
+// secondary action keeps its own, and every other is an outline button, so the
+// tool's actions read as one quiet row.
+func remoteToolsVariant(variant components.ButtonVariant) components.ButtonVariant {
+	switch variant {
+	case components.ButtonDestructive, components.ButtonSecondary:
+		return variant
+	}
+	return components.ButtonOutline
 }

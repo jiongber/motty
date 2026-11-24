@@ -48,6 +48,7 @@ type ToolsMessages struct {
 	HighlightRegex               string
 	HighlightCase                string
 	HighlightColor               string
+	HighlightCustomColor         string
 	HighlightErrorEmpty          string
 	HighlightErrorTooLong        string
 	HighlightErrorEverywhere     string
@@ -77,6 +78,25 @@ type ToolsMessages struct {
 	SnippetColumnGroup        string
 	SnippetFilterAll          string
 	SnippetFilterNone         string
+	SnippetGroupsManage       string
+	SnippetGroupsTitle        string
+	SnippetGroupsDescription  string
+	SnippetGroupCountFmt      string
+	SnippetGroupEmpty         string
+	SnippetGroupRename        string
+	SnippetGroupRenameTitle   string
+	SnippetGroupRenameField   string
+	SnippetGroupRenameSave    string
+	SnippetGroupRenameInvalid string
+	SnippetGroupConflict      string
+	SnippetGroupMissing       string
+	SnippetGroupDelete        string
+	SnippetGroupDeleteTitle   string
+	SnippetGroupDeleteBodyFmt string
+	SnippetGroupDeleteConfirm string
+	SnippetGroupsClose        string
+	StatusGroupRenamedFmt     string
+	StatusGroupDeletedFmt     string
 	SnippetCountFilteredFmt   string
 	SnippetColumnCommand      string
 	SnippetSortAction         string
@@ -102,6 +122,7 @@ type ToolsMessages struct {
 	SnippetCommand            string
 	SnippetCommandPlaceholder string
 	SnippetRun                string
+	SnippetLines              string
 	SnippetShortcut           string
 	SnippetShortcutNone       string
 	SnippetShortcutRecording  string
@@ -109,6 +130,7 @@ type ToolsMessages struct {
 	SnippetShortcutInvalid    string
 	SnippetErrorName          string
 	SnippetErrorCommand       string
+	SnippetErrorTooLong       string
 	SnippetErrorTooMany       string
 	SnippetSave               string
 	SnippetPaletteFmt         string
@@ -141,16 +163,29 @@ type ToolsMessages struct {
 	// The strip of saved commands under the terminal.
 	CommandsAdd   string
 	CommandsClose string
+	// CommandsResize is the tooltip of the strip along the bar's inner edge that
+	// drags its width.
+	CommandsResize string
 	// CommandsBarShow is the label of the picker's quiet checkbox for that strip;
 	// CommandsBarHidden is that checkbox's tooltip while unticked. Neither names
 	// the strip: the UI uses the language's own word for saved commands.
 	CommandsBarHidden string
 	CommandsBarShow   string
+	// CommandsPlacement labels the picker's dock control, and
+	// CommandsPlaceBottom / CommandsPlaceSide name its two docks: the strip
+	// under the terminal or the sidebar beside it.
+	CommandsPlacement   string
+	CommandsPlaceBottom string
+	CommandsPlaceSide   string
 	// CommandsFilter is the tooltip of the group-filter button at the bar's left
 	// and the heading of the menu it opens.
 	CommandsFilter string
 	// CommandsUngrouped is the checkbox for commands with no group in the filter.
 	CommandsUngrouped string
+	// CommandsCollapse and CommandsExpand are the hints of a group's heading in
+	// the bar: it folds the group's commands away, or lists them again.
+	CommandsCollapse string
+	CommandsExpand   string
 	// CommandsShowAll checks every group in the filter; CommandsHideAll clears them.
 	CommandsShowAll string
 	CommandsHideAll string
@@ -271,7 +306,10 @@ type ToolsMessages struct {
 	PasswordHintDescription string
 	CloseConfirmRow         string
 	CloseConfirmDescription string
-	PasswordHintGhost       string // drawn after a sudo prompt, beside the cursor
+
+	// Closing a window that still has sessions.
+	CloseWindowConfirmRow         string
+	CloseWindowConfirmDescription string
 
 	// The outbound proxy.
 	ProxyRow                    string
@@ -349,6 +387,7 @@ type ToolsMessages struct {
 	ImportSummaryFmt             string // hosts, client, duplicates
 	ImportWarningKeysFmt         string
 	ImportWarningSkippedFmt      string
+	ImportWarningSkippedHostFmt  string // a skipped repeat: its label and address
 	ImportWarningPasswords       string
 	ImportWarningCleartextFmt    string // sessions whose file held readable passwords or keys
 	ImportWarningLoopback        string // a session aimed at 127.0.0.1 / localhost
@@ -359,8 +398,26 @@ type ToolsMessages struct {
 	ImportPasswordsSavedFmt      string
 	ImportPasswordConflictFmt    string
 	ImportHostSaveUnavailable    string
+	ImportPreviewStale           string
 	ImportHostSaveFailedFmt      string
 	ImportHostSaveRollbackFailed string
+
+	TabbyImportTitle          string
+	TabbyImportDescription    string
+	TabbyImportSave           string
+	TabbyImportSavedFmt       string
+	TabbyImportKeysSkippedFmt string
+
+	TabbyVaultTitle        string
+	TabbyVaultDescription  string
+	TabbyVaultOptional     string
+	TabbyVaultSkip         string
+	TabbyVaultPassword     string
+	TabbyVaultUnlock       string
+	TabbyVaultReadFailed   string
+	TabbyVaultUnlockFailed string
+	TabbyVaultPreviewFmt   string
+	TabbyVaultSave         string
 
 	// Broadcast input.
 	BroadcastStart            string
@@ -401,25 +458,26 @@ type ToolsMessages struct {
 	SerialOpenedFmt        string
 
 	// File transfer over the terminal (ZMODEM).
-	TransferSentFmt           string
-	TransferReceivedFmt       string
-	TransferCancelled         string
-	TransferFailedFmt         string
-	TransferDeclined          string
-	TransferChooseFolderTitle string
-	TransferNoDownloads       string
-	TransferChooseFilesTitle  string
-	TransferTooManyFmt        string
-	TransferNotFileFmt        string
-	TransferTooBigFmt         string
-	TransferReceiveTitle      string
-	TransferSendTitle         string
-	TransferReceiveOfferFmt   string
-	TransferSendOfferFmt      string
-	TransferDecline           string
-	TransferChooseFiles       string
-	TransferChooseFolder      string
-	TransferToFolderFmt       string
+	TransferSentFmt               string
+	TransferReceivedFmt           string
+	TransferCancelled             string
+	TransferFailedFmt             string
+	TransferDeclined              string
+	TransferChooseFolderTitle     string
+	TransferNoDownloads           string
+	TransferChooseFilesTitle      string
+	TransferChooseSendFolderTitle string
+	TransferTooManyFmt            string
+	TransferNotFileFmt            string
+	TransferTooBigFmt             string
+	TransferReceiveTitle          string
+	TransferSendTitle             string
+	TransferReceiveOfferFmt       string
+	TransferSendOfferFmt          string
+	TransferDecline               string
+	TransferChooseFiles           string
+	TransferChooseFolder          string
+	TransferToFolderFmt           string
 
 	// The file panel.
 	CatFiles                        string
@@ -427,6 +485,8 @@ type ToolsMessages struct {
 	FilesPanelAutoOpenDescription   string
 	FilesDirectoryTree              string
 	FilesDirectoryTreeDescription   string
+	FilesPreviewLimit               string
+	FilesPreviewLimitDescription    string
 	FilesPanelPosition              string
 	FilesPanelPositionDescription   string
 	FilesPanelLeft, FilesPanelRight string
@@ -487,6 +547,7 @@ type ToolsMessages struct {
 	FilesFollowDescription          string
 	FilesLocateTerminal             string
 	FilesLocateTerminalSkipped      string
+	FilesLocateTerminalMissing      string
 	FilesTerminalFollow             string
 	FilesTerminalFollowDescription  string
 	FilesTerminalFollowSkipped      string
@@ -611,6 +672,15 @@ type ToolsMessages struct {
 	GeneralCloseDescription         string
 	GeneralCloseTray                string
 	GeneralCloseQuit                string
+	GeneralKeepWindows              string
+	GeneralKeepWindowsDescription   string
+	GeneralKeepWindowsKeep          string
+	GeneralKeepWindowsDiscard       string
+	GeneralKeepWindowsAsk           string
+	QuitKeepWindowsTitle            string
+	QuitKeepWindowsDescription      string
+	QuitKeepWindowsKeep             string
+	QuitKeepWindowsDiscard          string
 	GeneralRelaunch                 string
 	GeneralRelaunchDescription      string
 	GeneralRelaunchRaise            string
@@ -653,6 +723,8 @@ type ToolsMessages struct {
 	UpdateConfirmSubmit             string
 	UpdateDownloadingTitleFmt       string
 	UpdateVerifying                 string
+	UpdateInstallingTitleFmt        string
+	UpdateInstalling                string
 	UpdateRestarting                string
 	UpdateFailedTitle               string
 	UpdateFailedBodyFmt             string
@@ -662,6 +734,11 @@ type ToolsMessages struct {
 	ActionSSHFmt                    string
 	ActionBrowserFmt                string
 	ActionFilesFmt                  string
+	ActionRevealFmt                 string
+	ActionReveal                    string
+	ActionRevealFailed              string
+	ActionRevealMissing             string
+	GoToLinkTarget                  string
 	ActionExtractFmt                string
 	ActionCopyFmt                   string
 	DiagnosticsRow                  string
@@ -794,6 +871,10 @@ type ToolsMessages struct {
 	GistID                          string
 	GistFile                        string
 	GistAPI                         string
+	GistTokenPlaceholder            string
+	GistErrBackupPassword           string
+	GistErrNoCLI                    string
+	GistErrCLISignedOut             string
 	GistErrFields                   string
 	GistErrTooLarge                 string
 	GiteeDialogTitle                string
@@ -886,203 +967,230 @@ type ToolsMessages struct {
 	RemoteContainerDetailsTitle         string
 	RemoteContainerOverview             string
 	RemoteContainerEnvironmentEmpty     string
+	RemoteContainerConfiguration        string
+	RemoteContainerConfigurationLoading string
+	RemoteContainerCreated              string
+	RemoteContainerCommand              string
+	RemoteContainerImageID              string
+	RemoteContainerRestartPolicy        string
+	RemoteContainerPorts                string
+	RemoteContainerNetworks             string
+	RemoteContainerMounts               string
+	RemoteContainerNetworkIO            string
+	RemoteContainerBlockIO              string
+	RemoteContainerPIDs                 string
+	RemoteContainerUsageFailedFmt       string
 
-	RemoteProcessCopyPID            string
-	RemoteProcessCopyUser           string
-	RemoteProcessCopyCommand        string
-	RemoteProcessStateReady         string
-	RemoteProcessStateRunning       string
-	RemoteProcessStateSleeping      string
-	RemoteProcessStateWaiting       string
-	RemoteProcessStateZombie        string
-	RemoteProcessStateStopped       string
-	RemoteProcessStatePaging        string
-	RemoteProcessStateIdle          string
-	RemoteProcessStateBlocked       string
-	RemoteProcessStateSuspended     string
-	RemoteProcessStateTerminated    string
-	RemoteProcessStateGrowing       string
-	RemoteProcessStateNotResponding string
-	RemoteProcessStateUnknown       string
-	RemoteColName                   string
-	RemoteColImage                  string
-	RemoteColState                  string
-	RemoteColStatus                 string
-	RemoteColID                     string
-	RemoteRefresh                   string
-	RemoteAutoRefresh               string
-	RemoteAutoStart                 string
-	RemoteAutoStop                  string
-	RemoteRefreshIntervalFmt        string
-	RemoteDockerMissing             string
-	RemoteDockerMissingHint         string
-	RemoteTerminate                 string
-	RemoteForceKill                 string
-	RemoteStart                     string
-	RemoteStop                      string
-	RemoteRestart                   string
-	RemoteLogs                      string
-	RemoteEnterShell                string
-	RemoteErrNoShell                string
-	RemoteShellRequiresRunning      string
-	RemoteShellUnsupportedHost      string
-	RemoteRemove                    string
-	RemotePull                      string
-	RemotePullTitle                 string
-	RemotePullDescription           string
-	RemoteImageField                string
-	RemoteImagePlaceholder          string
-	RemoteBadImage                  string
-	RemoteCreate                    string
-	RemoteCreateVolumeTitle         string
-	RemoteCreateVolumeDescription   string
-	RemoteCreateNetworkTitle        string
-	RemoteCreateNetworkDescription  string
-	RemoteNameField                 string
-	RemoteBadName                   string
-	RemoteLoading                   string
-	RemoteLoadedFmt                 string
-	RemoteSearch                    string
-	RemoteSearchPlaceholder         string
-	RemoteSearchClear               string
-	RemoteSearchCountFmt            string
-	RemoteSearchLimited             string
-	RemoteEmptyContainers           string
-	RemoteErrUnsupportedFmt         string
-	RemoteErrNoDocker               string
-	RemoteErrFailedFmt              string
-	RemoteSnapshotCollectedFmt      string
-	RemoteSnapshotStaleFmt          string
-	RemoteRefreshRequired           string
-	RemoteProcessChanged            string
-	RemoteProcessUnverifiable       string
-	RemoteNeedSelection             string
-	RemoteSignalSentFmt             string
-	RemoteActionDoneFmt             string
-	RemoteConfirmTerminateTitle     string
-	RemoteConfirmKillTitle          string
-	RemoteConfirmProcessFmt         string
-	RemoteConfirmRemoveTitle        string
-	RemoteConfirmRemoveFmt          string
-	RemoteLogsFmt                   string
-	RemoteClose                     string
-	ExtEditButton                   string
-	ExtEditOpenedFmt                string
-	ExtEditSentFmt                  string
-	ExtEditSendFailedFmt            string
-	ExtEditBadFmt                   string
-	ExtEditRefused                  string
-	ExtEditOpenFailedFmt            string
-	ExtEditConflictTitle            string
-	ExtEditConflictDescriptionFmt   string
-	ExtEditReplace                  string
-	HostViewList                    string
-	HostViewGrid                    string
-	HostViewTree                    string
-	HostSort                        string
-	HostSortDone                    string
-	HostPrivacy                     string
-	HostPrivacyFields               string
-	HostPrivacyName                 string
-	HostPrivacyAddress              string
-	HostPrivacyUser                 string
-	HostPrivacyHiddenHost           string
-	BgGroup                         string
-	BgRow                           string
-	BgRowNone                       string
-	BgRowSetFmt                     string
-	BgChoose                        string
-	BgRemove                        string
-	BgPickerTitle                   string
-	BgVisibility                    string
-	BgSubtle                        string
-	BgMedium                        string
-	BgStrong                        string
-	BgLoading                       string
-	BgErrFmt                        string
-	BgErrTooLarge                   string
-	BgErrTooManyPixels              string
-	BgErrFormat                     string
-	TabMoveBusy                     string
-	OTPField                        string
-	OTPPlaceholder                  string
-	OTPSavedPlaceholder             string
-	OTPRemovingPlaceholder          string
-	OTPRemove                       string
-	OTPScan                         string
-	OTPPaste                        string
-	ErrOTPPasteNoImage              string
-	OTPScanTitle                    string
-	OTPScanFilter                   string
-	OTPScannedFmt                   string
-	ErrOTPScanTooLarge              string
-	ErrOTPScanDimension             string
-	ErrOTPScanNotImage              string
-	ErrOTPScanNoCode                string
-	ErrOTPScanNotOTP                string
-	ErrOTPScanMigration             string
-	ErrOTPScanManyFmt               string
-	ErrOTPScanReadFmt               string
-	X11Forward                      string
-	X11UnavailableFmt               string
-	X11NoServerFmt                  string
-	X11UnreachableFmt               string
-	X11Refused                      string
-	X11HintMac                      string
-	X11HintWindows                  string
-	X11HintOther                    string
-	AgentForward                    string
-	InteractiveOnly                 string
-	AgentAccess                     string
-	AgentAccessNote                 string
-	IdentitiesOnly                  string
-	IdentitiesOnlyNote              string
-	AdvancedSession                 string
-	AdvancedAgents                  string
-	AgentForwardUnavailableFmt      string
-	OTPKeep                         string
-	ErrOTPInvalid                   string
-	ErrOTPNoVault                   string
-	ErrOTPLocked                    string
-	ErrOTPCheckFmt                  string
-	OTPSavedFmt                     string
-	OTPRemovedFmt                   string
-	AlgoField                       string
-	AdvancedOptions                 string
-	TransferField                   string
-	TransferAuto                    string
-	AlgoDefault                     string
-	AlgoCompatible                  string
-	AlgoCustom                      string
-	AlgoCustomField                 string
-	AlgoCustomPlaceholder           string
-	ErrAlgoRequired                 string
-	LoginCommandField               string
-	LoginCommandPlaceholder         string
-	ErrLoginCommand                 string
-	IdleKeepAliveHeading            string
-	IdleKeepAliveField              string
-	IdleKeepAliveOff                string
-	IdleKeepAliveOneMinute          string
-	IdleKeepAliveFiveMinutes        string
-	IdleKeepAliveTenMinutes         string
-	IdleKeepAliveCustom             string
-	IdleKeepAliveCustomInterval     string
-	IdleKeepAliveUnitSeconds        string
-	IdleKeepAliveUnitMinutes        string
-	IdleKeepAliveInputField         string
-	IdleKeepAliveInputCR            string
-	IdleKeepAliveInputNUL           string
-	IdleKeepAliveInputCustom        string
-	IdleKeepAliveCustomInput        string
-	IdleKeepAliveCustomPlaceholder  string
-	ErrIdleKeepAliveInterval        string
-	ErrIdleKeepAliveInput           string
-	ErrAlgoUnknownFmt               string
-	AlgoWeakFmt                     string
-	AlgoNegotiatedFmt               string
-	UpdateFailedFmt                 string
-	LoginFailedFmt                  string
+	RemoteProcessCopyPID              string
+	RemoteProcessCopyUser             string
+	RemoteProcessCopyCommand          string
+	RemoteProcessStateReady           string
+	RemoteProcessStateRunning         string
+	RemoteProcessStateSleeping        string
+	RemoteProcessStateWaiting         string
+	RemoteProcessStateZombie          string
+	RemoteProcessStateStopped         string
+	RemoteProcessStatePaging          string
+	RemoteProcessStateIdle            string
+	RemoteProcessStateBlocked         string
+	RemoteProcessStateSuspended       string
+	RemoteProcessStateTerminated      string
+	RemoteProcessStateGrowing         string
+	RemoteProcessStateNotResponding   string
+	RemoteProcessStateUnknown         string
+	RemoteColName                     string
+	RemoteColImage                    string
+	RemoteColState                    string
+	RemoteColStatus                   string
+	RemoteColID                       string
+	RemoteColContainerMemory          string
+	RemoteRefresh                     string
+	RemoteAutoRefresh                 string
+	RemoteAutoStart                   string
+	RemoteAutoStop                    string
+	RemoteRefreshIntervalFmt          string
+	RemoteDockerMissing               string
+	RemoteDockerMissingHint           string
+	RemoteTerminate                   string
+	RemoteForceKill                   string
+	RemoteStart                       string
+	RemoteStop                        string
+	RemoteRestart                     string
+	RemoteLogs                        string
+	RemoteEnterShell                  string
+	RemoteErrNoShell                  string
+	RemoteShellRequiresRunning        string
+	RemoteShellUnsupportedHost        string
+	RemoteRemove                      string
+	RemotePull                        string
+	RemotePullTitle                   string
+	RemotePullDescription             string
+	RemoteImageField                  string
+	RemoteImagePlaceholder            string
+	RemoteBadImage                    string
+	RemoteCreate                      string
+	RemoteCreateVolumeTitle           string
+	RemoteCreateVolumeDescription     string
+	RemoteCreateNetworkTitle          string
+	RemoteCreateNetworkDescription    string
+	RemoteNameField                   string
+	RemoteBadName                     string
+	RemoteLoading                     string
+	RemoteLoadedFmt                   string
+	RemoteSearch                      string
+	RemoteSearchPlaceholder           string
+	RemoteSearchClear                 string
+	RemoteSearchCountFmt              string
+	RemoteSearchLimited               string
+	RemoteEmptyContainers             string
+	RemoteErrUnsupportedFmt           string
+	RemoteErrNoDocker                 string
+	RemoteErrFailedFmt                string
+	RemoteSnapshotCollectedFmt        string
+	RemoteSnapshotStaleFmt            string
+	RemoteRefreshRequired             string
+	RemoteProcessChanged              string
+	RemoteProcessUnverifiable         string
+	RemoteNeedSelection               string
+	RemoteSignalSentFmt               string
+	RemoteActionDoneFmt               string
+	RemoteConfirmTerminateTitle       string
+	RemoteConfirmKillTitle            string
+	RemoteConfirmProcessFmt           string
+	RemoteConfirmRemoveTitle          string
+	RemoteConfirmRemoveFmt            string
+	RemoteLogsFmt                     string
+	RemoteClose                       string
+	ExtEditButton                     string
+	ExtEditOpenedFmt                  string
+	ExtEditSentFmt                    string
+	ExtEditUnsentFmt                  string
+	ExtEditGoneFmt                    string
+	ExtEditSendFailedFmt              string
+	ExtEditBadFmt                     string
+	ExtEditTooLargeFmt                string
+	ExtEditRefused                    string
+	ExtEditOpenFailedFmt              string
+	ExtEditConflictTitle              string
+	ExtEditConflictDescriptionFmt     string
+	ExtEditReplace                    string
+	HostViewList                      string
+	HostViewGrid                      string
+	HostViewTree                      string
+	HostSort                          string
+	HostSortDone                      string
+	HostPrivacy                       string
+	HostPrivacyFields                 string
+	HostPrivacyName                   string
+	HostPrivacyAddress                string
+	HostPrivacyUser                   string
+	HostPrivacyHiddenHost             string
+	BgGroup                           string
+	BgRow                             string
+	BgRowNone                         string
+	BgRowSetFmt                       string
+	BgChoose                          string
+	BgRemove                          string
+	BgPickerTitle                     string
+	BgVisibility                      string
+	BgSubtle                          string
+	BgMedium                          string
+	BgStrong                          string
+	BgLoading                         string
+	BgErrFmt                          string
+	BgErrTooLarge                     string
+	BgErrTooManyPixels                string
+	BgErrFormat                       string
+	TabMoveBusy                       string
+	OTPField                          string
+	OTPPlaceholder                    string
+	OTPSavedPlaceholder               string
+	OTPRemovingPlaceholder            string
+	OTPRemove                         string
+	OTPScan                           string
+	OTPPaste                          string
+	ErrOTPPasteNoImage                string
+	OTPScanTitle                      string
+	OTPScanFilter                     string
+	OTPScannedFmt                     string
+	ErrOTPScanTooLarge                string
+	ErrOTPScanDimension               string
+	ErrOTPScanNotImage                string
+	ErrOTPScanNoCode                  string
+	ErrOTPScanNotOTP                  string
+	ErrOTPScanMigration               string
+	ErrOTPScanManyFmt                 string
+	ErrOTPScanReadFmt                 string
+	X11Forward                        string
+	X11UnavailableFmt                 string
+	X11NoServerFmt                    string
+	X11UnreachableFmt                 string
+	X11Refused                        string
+	X11HintMac                        string
+	X11HintWindows                    string
+	X11HintOther                      string
+	AgentForward                      string
+	InteractiveOnly                   string
+	AgentAccess                       string
+	AgentAccessNote                   string
+	IdentitiesOnly                    string
+	IdentitiesOnlyNote                string
+	AdvancedSession                   string
+	AdvancedAgents                    string
+	AgentForwardUnavailableFmt        string
+	OTPKeep                           string
+	ErrOTPInvalid                     string
+	ErrOTPNoVault                     string
+	ErrOTPLocked                      string
+	ErrOTPCheckFmt                    string
+	OTPSavedFmt                       string
+	OTPRemovedFmt                     string
+	AlgoField                         string
+	AdvancedOptions                   string
+	TransferField                     string
+	TransferAuto                      string
+	AlgoDefault                       string
+	AlgoCompatible                    string
+	AlgoCustom                        string
+	AlgoCustomField                   string
+	AlgoCustomPlaceholder             string
+	ErrAlgoRequired                   string
+	LoginCommandField                 string
+	LoginCommandPlaceholder           string
+	ErrLoginCommand                   string
+	LoginCommandPolicyField           string
+	LoginCommandStopOnError           string
+	LoginCommandContinueOnError       string
+	LoginCommandStepSuccessFmt        string
+	LoginCommandStepFailedStopFmt     string
+	LoginCommandStepFailedContinueFmt string
+	LoginCommandOutputFmt             string
+	LoginCommandAbortDisconnectFmt    string
+	LoginCommandAbortTimeoutFmt       string
+	LoginCommandAbortPromptFmt        string
+	IdleKeepAliveHeading              string
+	IdleKeepAliveField                string
+	IdleKeepAliveOff                  string
+	IdleKeepAliveOneMinute            string
+	IdleKeepAliveFiveMinutes          string
+	IdleKeepAliveTenMinutes           string
+	IdleKeepAliveCustom               string
+	IdleKeepAliveCustomInterval       string
+	IdleKeepAliveUnitSeconds          string
+	IdleKeepAliveUnitMinutes          string
+	IdleKeepAliveInputField           string
+	IdleKeepAliveInputCR              string
+	IdleKeepAliveInputNUL             string
+	IdleKeepAliveInputCustom          string
+	IdleKeepAliveCustomInput          string
+	IdleKeepAliveCustomPlaceholder    string
+	ErrIdleKeepAliveInterval          string
+	ErrIdleKeepAliveInput             string
+	ErrAlgoUnknownFmt                 string
+	AlgoWeakFmt                       string
+	AlgoNegotiatedFmt                 string
+	UpdateFailedFmt                   string
+	LoginFailedFmt                    string
 
 	// The file list's configurable columns and default download destination.
 	FilesColumns                         string

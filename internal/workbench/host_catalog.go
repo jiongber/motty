@@ -43,6 +43,21 @@ const (
 // hostIconOf is the icon that shows a system's badge.
 func hostIconOf(system sshconn.RemoteSystem) hostIcon { return hostIconSystem + hostIcon(system) }
 
+// autoIconSystem is the system the automatic icon shows: the one the host was
+// detected to run, or, before there is one, the system its protocol can only
+// be. RDP is Microsoft's remote desktop, whose account is the Windows user's
+// (FieldRDPUser), so a host added as RDP is a Windows host. VNC runs on any
+// system, so it stays unknown and keeps the generic desktop glyph.
+func autoIconSystem(system sshconn.RemoteSystem, protocol hostProtocol) sshconn.RemoteSystem {
+	if system != sshconn.SystemUnknown {
+		return system
+	}
+	if protocol == protocolRDP {
+		return sshconn.SystemWindows
+	}
+	return sshconn.SystemUnknown
+}
+
 // system is the system whose badge the icon shows, if it shows one.
 func (icon hostIcon) system() (sshconn.RemoteSystem, bool) {
 	if icon < hostIconSystem {
@@ -211,8 +226,10 @@ type hostMerge struct {
 	dropped, kept Host
 }
 
-// mergeKey is what makes two hosts one host for mergeSameHosts: the destination
-// and the name, as in sameHost.
+// mergeKey is what makes two hosts one host for mergeSameHosts: the destination,
+// the name and the group, as in sameHost and sameHostGroup. The group is part of
+// it so that a host the user keeps in two groups stays two hosts, while the same
+// host added on two devices, filed alike, still folds to one.
 type mergeKey struct {
 	protocol uint8
 	terminal uint8
@@ -221,10 +238,11 @@ type mergeKey struct {
 	port     uint16
 	viaSSH   bool
 	label    string
+	group    string
 }
 
 func mergeKeyOf(host Host) mergeKey {
-	key := mergeKey{protocol: uint8(host.Protocol), terminal: uint8(host.Terminal), address: host.Address, label: strings.ToLower(strings.TrimSpace(host.Label))}
+	key := mergeKey{protocol: uint8(host.Protocol), terminal: uint8(host.Terminal), address: host.Address, label: strings.ToLower(strings.TrimSpace(host.Label)), group: normalizeHostGroupPath(host.Group)}
 	if host.Protocol != protocolSerial {
 		key.user, key.port, key.viaSSH = host.User, host.Port, host.ViaSSH
 	}

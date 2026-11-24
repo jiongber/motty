@@ -21,10 +21,20 @@ var (
 	hitDialogRemoteAudio          = tree.ID(hostProtocolUiHits, "dialog-remote-audio")
 	hitDialogStandardSecurity     = tree.ID(hostProtocolUiHits, "dialog-standard-security")
 	hitDialogStandardSecurityHelp = tree.ID(hostProtocolUiHits, "dialog-standard-security-help")
+	hitDialogLegacyTLS            = tree.ID(hostProtocolUiHits, "dialog-legacy-tls")
+	hitDialogLegacyTLSHelp        = tree.ID(hostProtocolUiHits, "dialog-legacy-tls-help")
+	hitDialogEffectWallpaper      = tree.ID(hostProtocolUiHits, "dialog-effect-wallpaper")
+	hitDialogEffectFontSmoothing  = tree.ID(hostProtocolUiHits, "dialog-effect-font-smoothing")
+	hitDialogEffectComposition    = tree.ID(hostProtocolUiHits, "dialog-effect-composition")
+	hitDialogEffectWindowDrag     = tree.ID(hostProtocolUiHits, "dialog-effect-window-drag")
+	hitDialogEffectAnimations     = tree.ID(hostProtocolUiHits, "dialog-effect-animations")
+	hitDialogEffectThemes         = tree.ID(hostProtocolUiHits, "dialog-effect-themes")
+	hitDialogEffectCursorShadow   = tree.ID(hostProtocolUiHits, "dialog-effect-cursor-shadow")
 	hitDialogChromeless           = tree.ID(hostProtocolUiHits, "dialog-chromeless")
 	hitDialogPortsTrigger         = tree.ID(hostProtocolUiHits, "dialog-ports-trigger")
 	hitDialogAlgorithms           = tree.ID(hostProtocolUiHits, "dialog-algorithms")
 	hitDialogLoginCommand         = tree.ID(hostProtocolUiHits, "dialog-login-command")
+	hitDialogLoginCommandPolicy   = tree.ID(hostProtocolUiHits, "dialog-login-command-policy")
 	hitDialogAdvanced             = tree.ID(hostProtocolUiHits, "dialog-advanced")
 	hitDialogForwardX11           = tree.ID(hostProtocolUiHits, "dialog-forward-x11")
 	hitDialogAgentForward         = tree.ID(hostProtocolUiHits, "dialog-agent-forward")
@@ -105,9 +115,10 @@ func (editor *hostEditor) connectionType() hostConnectionType {
 // The segmented choices of the host form. Each is a Choice of the form's own
 // page, declared at the row its layout reserved.
 var (
-	hostConnectionChoices = [...]hostConnectionType{connectionSSH, connectionTelnet, connectionSerial, connectionVNC, connectionRDP, connectionMosh}
-	hostFlowChoices       = [...]serial.Flow{serial.FlowNone, serial.FlowHardware, serial.FlowSoftware}
-	hostAlgoChoices       = [...]algoMode{algoDefault, algoCompatible, algoCustom}
+	hostConnectionChoices  = [...]hostConnectionType{connectionSSH, connectionTelnet, connectionSerial, connectionVNC, connectionRDP, connectionMosh}
+	hostFlowChoices        = [...]serial.Flow{serial.FlowNone, serial.FlowHardware, serial.FlowSoftware}
+	hostAlgoChoices        = [...]algoMode{algoDefault, algoCompatible, algoCustom}
+	hostLoginPolicyChoices = [...]loginFailurePolicy{loginFailureStop, loginFailureContinue}
 )
 
 // hostConnectionChoiceLabel names one connection type as the form's choice
@@ -156,6 +167,16 @@ func (state *State) hostAlgoChoiceLabel(mode algoMode) string {
 		return state.messages.Tools.AlgoCustom
 	default:
 		return state.messages.Tools.AlgoDefault
+	}
+}
+
+// hostLoginPolicyChoiceLabel names one post-login failure policy as the form's choice shows it.
+func (state *State) hostLoginPolicyChoiceLabel(policy loginFailurePolicy) string {
+	switch policy {
+	case loginFailureContinue:
+		return state.messages.Tools.LoginCommandContinueOnError
+	default:
+		return state.messages.Tools.LoginCommandStopOnError
 	}
 }
 
@@ -241,7 +262,7 @@ func (state *State) declareHostEndpointSlots(c ui.C, parent ui.Box, rowHeight fl
 				hint := state.hostUserHint(state.messages.Desktop.VNCUserHint)
 				if editor.viaSSH {
 					label = state.messages.Desktop.FieldSSHUser
-					hint = state.hostUserHint(m.FieldUserPlaceholder)
+					hint = state.hostUserHint(state.hostSystemUserHint())
 				}
 				state.declareHostTextField(c, slots.second, &form.fieldUser, hitDialogUser, &editor.user, label, hint, false, rowHeight)
 				slots.password = ui.Slot(c).Grow(1)
@@ -256,7 +277,7 @@ func (state *State) declareHostEndpointSlots(c ui.C, parent ui.Box, rowHeight fl
 			})
 			ui.Row(c).Height(rowHeight).Gap(8).Children(func() {
 				slots.second = ui.Slot(c).Grow(1)
-				state.declareHostTextField(c, slots.second, &form.fieldUser, hitDialogUser, &editor.user, m.FieldUser, state.hostUserHint(m.FieldUserPlaceholder), false, rowHeight)
+				state.declareHostTextField(c, slots.second, &form.fieldUser, hitDialogUser, &editor.user, m.FieldUser, state.hostUserHint(state.hostSystemUserHint()), false, rowHeight)
 				slots.authentication = ui.Slot(c).Grow(1)
 				state.declareHostAuthenticationChoice(c, slots.authentication, rowHeight)
 				if editor.auth == authPrivateKey {
@@ -292,7 +313,7 @@ func (state *State) declareHostEndpointSlots(c ui.C, parent ui.Box, rowHeight fl
 			})
 			ui.Row(c).Height(rowHeight).Gap(8).Children(func() {
 				slots.second = ui.Slot(c).Grow(1)
-				state.declareHostTextField(c, slots.second, &form.fieldUser, hitDialogUser, &editor.user, m.FieldUser, state.hostUserHint(m.FieldUserPlaceholder), false, rowHeight)
+				state.declareHostTextField(c, slots.second, &form.fieldUser, hitDialogUser, &editor.user, m.FieldUser, state.hostUserHint(state.hostSystemUserHint()), false, rowHeight)
 				slots.password = ui.Slot(c).Grow(1)
 				state.declareHostPasswordField(c, slots.password, m.FieldPassword)
 			})
@@ -329,6 +350,13 @@ func (state *State) declareHostTextField(c ui.C, parent ui.Box, field *dialogFie
 	state.editor.form.body.addField(id, field)
 }
 
+func (state *State) declareHostTextAreaField(c ui.C, parent ui.Box, field *dialogField, id gfx.ID, editor *text.Editor, label, placeholder string, height float32) {
+	parent.Children(func() {
+		field.declare(c, state, editor, dialogFieldSpec{ID: id, Label: label, Placeholder: placeholder, Multiline: true, Height: height})
+	})
+	state.editor.form.body.addField(id, field)
+}
+
 // declareHostAuthenticationChoice declares the authentication policy as a page
 // select over the protocols' fixed choices. A change closes the pickers over the
 // field and refills the secrets the new policy needs.
@@ -346,7 +374,7 @@ func (state *State) declareHostAuthenticationChoice(c ui.C, parent ui.Box, rowHe
 	label := state.messages.FieldAuthentication
 	parent.Children(func() {
 		ui.FormField(c, &form.authField, label).FillWidth().Height(rowHeight).Children(func() {
-			form.authBox = ui.Select(c, &editor.auth, choices[:count], state.authLabel).Label(label).Hit(hitDialogAuth, label)
+			form.authBox = ui.Select(c, &editor.auth, choices[:count], state.authLabel).Label(label)
 			if form.authBox.Changed() {
 				editor.identityOpen, editor.credentialOpen = false, false
 				state.dialogError = ""
@@ -376,7 +404,7 @@ func (state *State) declareHostPortsSelect(c ui.C, parent ui.Box, rowHeight floa
 	parent.Children(func() {
 		ui.FormField(c, &form.portsField, label).FillWidth().Height(rowHeight).Children(func() {
 			form.portsBox = ui.Select(c, &form.portChoice, form.portChoices, func(device string) string { return device }).
-				Label(label).Placeholder("…").Small().Hit(hitDialogPortsTrigger, label)
+				Label(label).Placeholder("…").Small()
 			if form.portsBox.Changed() {
 				editor.address = text.Editor{}
 				editor.address.Insert(form.portChoice)
@@ -456,6 +484,10 @@ func (state *State) clickHostProtocol(id gfx.ID) bool {
 		editor.noAudio = !editor.noAudio
 	case id == hitDialogStandardSecurity:
 		editor.standardSecurity = !editor.standardSecurity
+	case id == hitDialogLegacyTLS:
+		editor.legacyTLS = !editor.legacyTLS
+	case state.clickDesktopQuality(id):
+		// An RDP effect switch flipped its own setting.
 	case id == hitDialogAdvanced:
 		editor.advancedOpen = !editor.advancedOpen
 	case id == hitDialogForwardX11:
@@ -468,6 +500,12 @@ func (state *State) clickHostProtocol(id gfx.ID) bool {
 		editor.identitiesOnly = !editor.identitiesOnly
 	case id == hitDialogNoHistory:
 		editor.noHistory = !editor.noHistory
+	case id == hitDialogLoginCommandPolicy:
+		if editor.loginFailurePolicy == loginFailureStop {
+			editor.loginFailurePolicy = loginFailureContinue
+		} else {
+			editor.loginFailurePolicy = loginFailureStop
+		}
 	case id == hitDialogAgentAccess:
 		editor.agentAccess = !editor.agentAccess
 		editor.agentAccessChanged = true
@@ -598,9 +636,12 @@ const advancedHeaderHeight = 48
 // it: 8px each, around its 32px.
 const advancedHeaderGap = 8
 
+const loginCommandAreaHeight = 104
+
 // sshAdvancedRowsHeight is the room of the SSH-only part of an open Advanced
-// section: the algorithm choice (a third row for a custom list), the one-time
-// code secret with its buttons, and the switches.
+// section: the algorithm choice (a third row for a custom list), the login
+// command and failure policy, the one-time code secret with its buttons, and
+// the switches.
 func (state *State) sshAdvancedRowsHeight() float32 {
 	if state.editor.protocol != protocolSSH {
 		return 0
@@ -609,7 +650,7 @@ func (state *State) sshAdvancedRowsHeight() float32 {
 	if state.editor.algoMode == algoCustom {
 		rows++
 	}
-	return rows*hostFormRowHeight + hostFormRowHeight + otpFieldHeight + otpButtonsRow + state.sshSwitchRowsHeight()
+	return rows*hostFormRowHeight + loginCommandAreaHeight + hostFormRowHeight + otpFieldHeight + otpButtonsRow + state.sshSwitchRowsHeight()
 }
 
 // idleAdvancedRowsHeight is the room of the idle keepalive rows: a heading, the
@@ -700,13 +741,13 @@ const (
 
 // hostVNCRowsBody is where the desktop switches' body put each checkbox row.
 type hostVNCRowsBody struct {
-	standardSecurityHelp ui.Box
+	standardSecurityHelp, legacyTLSHelp ui.Box
 }
 
 // hostAlgoRowsBody is where the SSH algorithm rows put each control.
 type hostAlgoRowsBody struct {
-	algo, custom, login, otp, scan, paste, remove ui.Box
-	identitiesOnlyHelp, agentHelp                 ui.Box
+	algo, custom, login, loginPolicy, otp, scan, paste, remove ui.Box
+	identitiesOnlyHelp, agentHelp                              ui.Box
 }
 
 // paintAlgorithmRows draws the SSH algorithm choice and, for a custom one, the
@@ -743,8 +784,12 @@ func (state *State) declareHostAlgoRows(c ui.C) {
 			b.custom = ui.Slot(c).Height(rowHeight)
 			state.declareHostTextField(c, b.custom, &form.fieldAlgoCustom, hitDialogAlgorithms, &editor.algorithms, m.AlgoCustomField, m.AlgoCustomPlaceholder, false, rowHeight)
 		}
-		b.login = ui.Slot(c).Height(rowHeight)
-		state.declareHostTextField(c, b.login, &form.fieldLoginCommand, hitDialogLoginCommand, &editor.loginCommand, m.LoginCommandField, m.LoginCommandPlaceholder, false, rowHeight)
+		b.login = ui.Slot(c).Height(loginCommandAreaHeight)
+		state.declareHostTextAreaField(c, b.login, &form.fieldLoginCommand, hitDialogLoginCommand, &editor.loginCommand, m.LoginCommandField, m.LoginCommandPlaceholder, loginCommandAreaHeight)
+		b.loginPolicy = hostFormChoice(c, m.LoginCommandPolicyField, rowHeight, &editor.loginFailurePolicy, hostLoginPolicyChoices[:], state.hostLoginPolicyChoiceLabel)
+		if b.loginPolicy.Changed() {
+			state.dialogError = ""
+		}
 		ui.Row(c).Height(otpFieldHeight).Gap(8).Children(func() {
 			b.otp = ui.Slot(c).Grow(1)
 			placeholder := m.OTPPlaceholder
@@ -794,24 +839,25 @@ func (state *State) declareHostAlgoRows(c ui.C) {
 // vncRowsHeight is the room of the three switches every remote desktop host has.
 const vncRowsHeight = 4 + 20 + (12 + 20) + (12 + 20) + 16
 
-// rdpRowsHeight adds the three switches only an RDP host has: the console
-// session, remote audio and Standard RDP Security.
-const rdpRowsHeight = vncRowsHeight + 3*(12+20)
+// rdpRowsHeight adds the four switches only an RDP host has: the console
+// session, remote audio, Standard RDP Security and legacy TLS.
+const rdpRowsHeight = vncRowsHeight + 4*(12+20)
 
 // desktopRowsHeight is the room paintVNCRows takes for the protocol on screen.
 func (state *State) desktopRowsHeight() float32 {
 	if state.editor.protocol == protocolRDP {
-		return rdpRowsHeight
+		return rdpRowsHeight + desktopQualityRowsHeight(protocolRDP)
 	}
-	return vncRowsHeight
+	return vncRowsHeight + desktopQualityRowsHeight(protocolVNC)
 }
 
 // paintVNCRows paints the switches of a VNC or RDP host in the slots the host
 // form's page laid out: connecting through SSH, sharing the clipboard, showing
 // the picture without the bars around it and, for RDP, asking Windows for its
-// console (administrative) session, playing remote sound and choosing Standard
-// RDP Security. A host whose route carries the connection cannot also use the
-// same-machine tunnel, so that switch is dimmed and inert.
+// console (administrative) session, playing remote sound, choosing Standard
+// RDP Security and allowing the legacy TLS suites. A host whose route carries
+// the connection cannot also use the same-machine tunnel, so that switch is
+// dimmed and inert.
 func (state *State) paintVNCRows(canvas *gfx.Canvas) {
 	editor, m := &state.editor, state.messages.Desktop
 	b := &editor.form.vncBody
@@ -821,6 +867,7 @@ func (state *State) paintVNCRows(canvas *gfx.Canvas) {
 	if editor.form.layoutProtocol == protocolRDP {
 		// After the checkbox, whose words reach to the end of the row, so that
 		// this is the hit on top where the two meet.
+		state.paintHelpIcon(canvas, hitDialogLegacyTLSHelp, m.LegacyTLSNote, b.legacyTLSHelp.Rect())
 		state.paintHelpIcon(canvas, hitDialogStandardSecurityHelp, m.StandardSecurityNote, b.standardSecurityHelp.Rect())
 	}
 }
@@ -828,7 +875,8 @@ func (state *State) paintVNCRows(canvas *gfx.Canvas) {
 // declareHostVNCRows lays out the switches of a VNC or RDP host: connecting
 // through SSH, sharing the clipboard, showing the picture without the bars
 // around it and, for RDP, asking Windows for its console (administrative)
-// session, playing remote sound and choosing Standard RDP Security.
+// session, playing remote sound, choosing Standard RDP Security and allowing
+// the legacy TLS suites.
 func (state *State) declareHostVNCRows(c ui.C) {
 	editor, m := &state.editor, state.messages.Desktop
 	b := &editor.form.vncBody
@@ -848,7 +896,10 @@ func (state *State) declareHostVNCRows(c ui.C) {
 		if editor.protocol == protocolRDP {
 			state.declareDialogCheck(c, hitDialogConsole, m.ConsoleSession, editor.console, 12, 0)
 			state.declareDialogCheck(c, hitDialogRemoteAudio, m.RemoteAudio, !editor.noAudio, 12, 0)
+			_, b.legacyTLSHelp = state.declareDialogCheckHelp(c, hitDialogLegacyTLS, m.LegacyTLS, editor.legacyTLS, 12, 0)
 			_, b.standardSecurityHelp = state.declareDialogCheckHelp(c, hitDialogStandardSecurity, m.StandardSecurity, editor.standardSecurity, 12, 0)
 		}
+		ui.Slot(c).Height(16)
+		state.declareDesktopQualityRows(c)
 	})
 }

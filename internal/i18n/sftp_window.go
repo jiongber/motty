@@ -6,7 +6,7 @@ type SFTPWindowMessages struct {
 	LocalMovies, LocalApplications                                                                          string
 	ProfileScope, BrowseRootLabel                                                                           string
 	ProfileSite, ProfileShared, ProfileNew, ProfileDelete, ProfileOpen, ProfileEmpty, ProfileNameExists     string
-	ProfileSync, ProfileQuickTitle, ProfileQuickDescription, ProfileQuickSync, ProfileChoose                string
+	ProfileSync, ProfileQuickSync, ProfileChoose                                                            string
 	DirectoryTree, ShowDirectoryTree, HideDirectoryTree, DirectoryTreeLoadFailedFmt, DirectoryTreeTruncated string
 	DirectoryTreeNeedsWidth                                                                                 string
 	BrowseSync, BrowseHint, BrowseRootsFmt, BrowseOutside, BrowseFailedFmt                                  string
@@ -17,7 +17,7 @@ type SFTPWindowMessages struct {
 	BookmarkInvalid, BookmarkLimit                                                                          string
 	ConnectingFmt                                                                                           string
 	Authenticate, AuthenticationHint                                                                        string
-	DropUploadHint, DropDownloadHint, DropCopyHint                                                          string
+	DropUploadHint, DropDownloadHint, DropCopyHint, DropMoveHint                                            string
 	QueueRejectedFmt                                                                                        string
 	Open, Title, Local, Remote, Path, Name, Size, Modified                                                  string
 	Upload, Download, DragHint, DropUpload, DropDownload                                                    string

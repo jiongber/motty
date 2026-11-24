@@ -1,6 +1,7 @@
 package workbench
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"math"
 	"slices"
@@ -35,7 +36,9 @@ var (
 	hitDesktopCtrlAltDel = tree.ID(desktopHits, "ctrl-alt-del")
 	hitDesktopReconnect  = tree.ID(desktopHits, "reconnect")
 	hitDesktopFullscreen = tree.ID(desktopHits, "fullscreen")
+	hitDesktopBarPin     = tree.ID(desktopHits, "bar-pin")
 	hitDesktopLatency    = tree.ID(desktopHits, "latency")
+	hitDesktopQuality    = tree.ID(desktopHits, "quality")
 )
 
 const (
@@ -70,9 +73,13 @@ type desktopView struct {
 	buttons  desktop.Buttons
 	// held is the keys pressed on the remote side and not yet released, so a
 	// release is sent only for a press that was.
-	held     []heldKey
-	wheel    gfx.Point
-	sentClip string
+	held  []heldKey
+	wheel gfx.Point
+	// sentClip is the text this side last gave the remote clipboard and sentImage
+	// the picture: an unchanged clipboard is not offered again, and whichever
+	// format is offered replaces the other one on the remote side.
+	sentClip  string
+	sentImage imageDigest
 	// files is the transfer of files from this computer to the remote clipboard.
 	files desktopFiles
 	// chromeless is the host's choice to show only the picture: no bar above it
@@ -105,7 +112,13 @@ type desktopView struct {
 	asked, pending desktopTarget
 	pendingSince   time.Duration
 	settling       bool
+	// qualityMenu is whether the quality menu of the bar is open.
+	qualityMenu bool
 }
+
+// imageDigest identifies the picture a desktop's clipboard was last given, so the
+// same one is not offered by every click; the zero value says none was.
+type imageDigest [sha256.Size]byte
 
 // desktopTarget is the desktop a pane wants of a server that follows it: as
 // many pixels as the pane has, and the scale of the display they are on.
@@ -202,6 +215,15 @@ func (view *desktopView) logicalPerPixel() float32 {
 	return 1 / view.pixelScale
 }
 
+// oneToOne reports whether the picture is drawn one picture pixel to one device
+// pixel: at 100% whatever the server's size is, and in Fit mode for the picture a
+// resizing server makes the size of the pane. That is the size of the server's
+// own screen; on a scaled display, drawing the picture on logical pixels instead
+// magnified it and its edges fell outside the pane.
+func (view *desktopView) oneToOne() bool {
+	return !view.fit || view.pixelPerfect()
+}
+
 func (view *desktopView) close() {
 	untrackDesktopPicture(view)
 	if view.session != nil {
@@ -216,7 +238,9 @@ func (view *desktopView) present() bool {
 		view.width, view.height = view.surface.Size()
 		noteDesktopSize(view, view.width, view.height)
 	}
-	view.presentPointer()
+	if !view.ended {
+		view.presentPointer()
+	}
 	return changed
 }
 
@@ -242,6 +266,9 @@ func (view *desktopView) presentPointer() {
 // pixels per logical pixel the shape is made for: the remote's pixels are the
 // screen's.
 func (view *desktopView) pointerCursor(scale float32) (gfx.PointerCursor, *gfx.CursorImage) {
+	if view.ended {
+		return gfx.PointerCursorDefault, nil
+	}
 	switch view.pointerKind {
 	case desktop.PointerHidden:
 		return gfx.PointerCursorHidden, nil
@@ -317,17 +344,14 @@ func (view *desktopView) place(area gfx.Rect) (origin gfx.Point, scale float32) 
 	if width <= 0 || height <= 0 || area.Width <= 0 || area.Height <= 0 {
 		return gfx.Point{X: area.X, Y: area.Y}, 1
 	}
-	pixelPerfect := view.pixelPerfect()
-	scale = 1
-	switch {
-	case pixelPerfect:
-		scale = view.logicalPerPixel()
-	case view.fit:
+	oneToOne := view.oneToOne()
+	scale = view.logicalPerPixel()
+	if !oneToOne {
 		scale = min(area.Width/width, area.Height/height, desktopMaxScale)
 	}
 	shownWidth, shownHeight := width*scale, height*scale
 	axis := func(start, room, shown, pointer float32) float32 {
-		if pixelPerfect && view.fit {
+		if oneToOne && view.fit {
 			return start
 		}
 		if shown <= room {
@@ -342,7 +366,7 @@ func (view *desktopView) place(area gfx.Rect) (origin gfx.Point, scale float32) 
 		X: axis(area.X, area.Width, shownWidth, view.pointer.X),
 		Y: axis(area.Y, area.Height, shownHeight, view.pointer.Y),
 	}
-	if pixelPerfect && view.pixelScale > 0 {
+	if oneToOne && view.pixelScale > 0 {
 		snap := func(value float32) float32 {
 			return float32(math.Floor(float64(value)*float64(view.pixelScale)+0.5)) / view.pixelScale
 		}
@@ -424,6 +448,8 @@ func (state *State) endDesktop(session *Session) {
 		return
 	}
 	session.desk.ended = true
+	session.desk.pointerKind = desktop.PointerSystem
+	session.desk.cursorImage = nil
 	session.desk.releaseInput()
 	session.term.ended = true
 }
@@ -462,6 +488,7 @@ func (state *State) pumpDesktop(session *Session) {
 	state.finishFileOffers(view)
 	receivedFiles := false
 	if receiver, ok := view.session.(desktop.FileReceiver); ok {
+		state.pumpReceivingFiles(view, receiver)
 		if files, ok := receiver.RemoteFiles(); ok {
 			state.receiveDesktopFiles(view, files)
 			receivedFiles = len(files.Paths) > 0
@@ -509,7 +536,8 @@ func (state *State) offerClipboard() {
 }
 
 // syncClipboard gives the remote the local clipboard if it changed since the
-// last time, for a host that shares it.
+// last time, for a host that shares it: its files, or its text, or the picture a
+// clipboard with no words holds.
 func (state *State) syncClipboard(view *desktopView) {
 	if !view.clipboard || view.ended {
 		return
@@ -517,13 +545,53 @@ func (state *State) syncClipboard(view *desktopView) {
 	if view.files.remote != nil && state.syncClipboardFiles(view) {
 		return
 	}
-	text, err := state.options.ClipboardText()
-	if err != nil || text == "" || text == view.sentClip {
+	if text, err := state.options.ClipboardText(); err == nil && text != "" {
+		if text == view.sentClip {
+			return
+		}
+		view.sentClip = text
+		view.sentImage = imageDigest{}
+		view.files.dropped = false
+		_ = view.session.SetClipboard(text)
 		return
 	}
-	view.sentClip = text
+	// The clipboard holds no words, and some systems answer a text request on a
+	// picture with an error. A picture is not an empty clipboard on a host that
+	// takes one: offer it, as a paste in a terminal gives the shell a path to it.
+	state.syncClipboardImage(view)
+}
+
+// syncClipboardImage offers the picture on the system clipboard when it is what
+// the clipboard holds. A host whose protocol carries only text (VNC) is never
+// asked for it.
+func (state *State) syncClipboardImage(view *desktopView) {
+	clipboard, ok := view.session.(desktop.ImageClipboard)
+	if !ok {
+		return
+	}
+	png, digest, ok := state.clipboardImage()
+	if !ok {
+		view.sentImage = imageDigest{}
+		return
+	}
+	if digest == view.sentImage {
+		return
+	}
+	view.sentImage = digest
+	// The picture replaces what the remote clipboard held, not only the words
+	// here: text it still had is not what was copied any more.
+	view.sentClip = ""
 	view.files.dropped = false
-	_ = view.session.SetClipboard(text)
+	_ = clipboard.SetClipboardImage(png)
+}
+
+// clipboardImage reads the picture on the system clipboard, if one is there.
+func (state *State) clipboardImage() (png []byte, digest imageDigest, ok bool) {
+	png, err := state.options.ClipboardImagePNG()
+	if err != nil || len(png) == 0 {
+		return nil, imageDigest{}, false
+	}
+	return png, imageDigest(sha256.Sum256(png)), true
 }
 
 // heldKey is a key the remote side has down: the local key that is holding it
@@ -708,6 +776,22 @@ func (state *State) desktopHoldsTheKeyboard() bool {
 		return false
 	}
 	return state.desktopVisible(session)
+}
+
+// keepKeyboardOnDesktop gives the keyboard back to the remote desktop in front after a click on
+// one of Motty's own controls (a tab, a toolbar button, a menu entry). A press moves the focus to
+// the control, but while the desktop holds the keyboard every key, Alt+Tab included, is the
+// remote's, and only the focused desktop is sent them: left on the control, Alt+Tab would be a
+// Tab through Motty's controls and the modifier press would never leave the window. The picture
+// asks for it in the paint that follows, so a control that opens its own field or menu in the
+// same click still decides where the keyboard goes.
+func (state *State) keepKeyboardOnDesktop() {
+	if !state.desktopHoldsTheKeyboard() {
+		return
+	}
+	if session, ok := state.sessionByIDPointer(state.activeSessionID); ok && session.desk != nil {
+		session.desk.focusPending = true
+	}
 }
 
 // systemKeyCapture is how the window takes the system's shortcuts (the Windows key and its
@@ -926,6 +1010,12 @@ func (state *State) clickDesktop(id gfx.ID) bool {
 		view.fit = false
 	case hitDesktopFullscreen:
 		state.toggleDesktopFullscreen(session)
+	case hitDesktopBarPin:
+		state.setDesktopFullscreenBarAutoHide(!state.desktopBar.autoHide)
+	case hitDesktopQuality:
+		if !view.ended {
+			view.qualityMenu = !view.qualityMenu
+		}
 	case hitDesktopCapture:
 		state.toggleCapture(view)
 	case hitDesktopCtrlAltDel:
@@ -976,15 +1066,12 @@ func (state *State) declareDesktopBody(c ui.C, session *Session, bounds gfx.Rect
 		}
 	}
 	if view.chromeless || view.fullscreen {
-		// These views show the picture alone: no controls. The bars are still
-		// declared under the picture, as they always were, so the layout that
-		// gives the picture its area is the same one; fullscreen keeps its
-		// controls over it.
 		ui.Stack(c).Fill().Background(pal.workspace).Children(func() {
 			state.declareDesktopInfoBar(c, session, view, s, bounds, title, status, showStatus, false)
 			state.declareDesktopStrip(c, session, view, s, true)
 			ui.Slot(c).Absolute().Left(0).Right(0).Top(infoBarHeight).Bottom(desktopStripHeight).
 				Background(state.ground(state.termPal.terminal)).Draw(s.pictureDraw)
+			state.declareDesktopEnded(c, session, view.area.X-bounds.X, view.area.Y-bounds.Y)
 			if view.fullscreen {
 				state.declareDesktopFullscreenControls(c, view, session)
 			}
@@ -995,7 +1082,7 @@ func (state *State) declareDesktopBody(c ui.C, session *Session, bounds gfx.Rect
 		state.declareDesktopInfoBar(c, session, view, s, bounds, title, status, showStatus, true)
 		ui.Stack(c).Grow(1).Children(func() {
 			ui.Slot(c).Fill().Background(state.ground(state.termPal.terminal)).Draw(s.pictureDraw)
-			state.declareDesktopReconnect(c, session, view)
+			state.declareDesktopEnded(c, session, 0, 0)
 		})
 		state.declareDesktopStrip(c, session, view, s, false)
 	})
@@ -1036,6 +1123,10 @@ func (state *State) declareDesktopInfoBar(c ui.C, session *Session, view *deskto
 					}
 					s.capture = state.declareIconButton(c, state.paneIdentity(session, hitDesktopCapture), iconKeyboard, captureHint, view.ended, captureStyle).Size(barToolSize, barToolSize).Shrink(0)
 				}
+				if withTools && state.paneInSplit(session.ID) {
+					state.declareSessionMaximizeButton(c, session)
+					state.declarePaneBarClose(c, session)
+				}
 			})
 		})
 		ui.Row(c).FillWidth().Height(1).Self(ui.End).Background(pal.line)
@@ -1069,24 +1160,61 @@ func (state *State) declareDesktopTools(c ui.C, session *Session, view *desktopV
 		if view.ended {
 			fullscreen = fullscreen.Disabled(true)
 		}
+		quality := ui.Button(c, m.Quality).XSmall().Ghost().Hit(state.paneIdentity(session, hitDesktopQuality), m.Quality)
+		if view.ended {
+			quality = quality.Disabled(true)
+		}
+		state.declareDesktopQualityMenu(c, session, view, quality)
 	})
 }
 
-// declareDesktopReconnect declares the button the ended page offers over the
-// dimmed picture. It is the same width the canvas row gave it: a 28px button at
-// the right of a width the picture's own width bounds.
-func (state *State) declareDesktopReconnect(c ui.C, session *Session, view *desktopView) {
-	if !view.ended || !state.canReconnect(session) {
+const (
+	desktopEndedCardWidth  = float32(460)
+	desktopEndedCardHeight = float32(172)
+	desktopEndedCardPad    = float32(20)
+)
+
+func (state *State) declareDesktopEnded(c ui.C, session *Session, left, top float32) {
+	view := session.desk
+	if !view.ended {
 		return
 	}
-	m := state.messages.Desktop
 	area := view.area
-	width := min(max(area.Width-32, 120), 420)
-	left := (area.Width - width) / 2
-	top := max((area.Height-132)/2, 8) + 78
-	label := m.Reconnect
-	ui.Row(c).Absolute().Left(left).Top(top).Width(width).Height(28).Items(ui.Center).Justify(ui.End).Children(func() {
-		ui.Button(c, label).Small().Hit(state.paneIdentity(session, hitDesktopReconnect), label)
+	cardWidth := min(max(area.Width-16, 0), desktopEndedCardWidth)
+	cardHeight := min(max(area.Height-16, 0), desktopEndedCardHeight)
+	pad := min(desktopEndedCardPad, max((cardHeight-52)/2, 0))
+	pal, m := state.pal, state.messages.Desktop
+	reason := state.failureLine(session)
+	if session.err != nil && reason == "" {
+		reason = session.err.Error()
+	}
+	ui.Stack(c).Absolute().Left(left).Top(top).Width(area.Width).Height(area.Height).Clip().
+		Background(withAlpha(pal.shell, 0.78)).Children(func() {
+		ui.Slot(c).Fill().Draw(func(d *ui.DrawContext) { d.Canvas.Block(d.Rect) })
+		ui.Stack(c).Absolute().Left((area.Width-cardWidth)/2).Top((area.Height-cardHeight)/2).
+			Width(cardWidth).Height(cardHeight).Background(pal.surface).Radius(radius.popup).
+			Border(1, pal.line).Shadow(gfx.ShadowMD).Clip().Children(func() {
+			ui.Column(c).Fill().Pad(pad).Children(func() {
+				if cardHeight >= 52 {
+					ui.Text(c, m.Disconnected).FontSize(16).Weight(gfx.WeightSemibold).Color(pal.text).LineHeight(24).Shrink(0).Ellipsis()
+				}
+				if reason != "" {
+					ui.Scroll(c).Grow(1).MinHeight(0).FillWidth().Scrollbars().Children(func() {
+						ui.Wrap(c, fmt.Sprintf(m.DisconnectedFmt, reason)).FillWidth().FontSize(metrics.FontSizeS).Color(pal.muted).LineHeight(18)
+					})
+				} else {
+					ui.Slot(c).Grow(1).MinHeight(0)
+				}
+				if state.canReconnect(session) {
+					ui.Row(c).FillWidth().Height(28).Shrink(0).Items(ui.Center).Justify(ui.End).Children(func() {
+						ui.Button(c, m.Reconnect).Small().Hit(state.paneIdentity(session, hitDesktopReconnect), m.Reconnect)
+					})
+					if cardHeight >= 140 {
+						ui.Text(c, m.ReconnectHint).FontSize(metrics.FontSizeS).Color(pal.faint).LineHeight(18).Shrink(0).Ellipsis()
+					}
+				}
+			})
+		})
 	})
 }
 
@@ -1168,14 +1296,11 @@ func (state *State) paintDesktopPicture(d *ui.DrawContext, session *Session) {
 	canvas.Clip(area)
 	if view.width > 0 && view.height > 0 {
 		origin, scale := view.place(area)
-		if view.pixelPerfect() {
+		if view.oneToOne() {
 			view.surface.DrawPixels(canvas, origin)
 		} else {
 			view.surface.Draw(canvas, gfx.Rect{X: origin.X, Y: origin.Y, Width: float32(view.width) * scale, Height: float32(view.height) * scale})
 		}
-	}
-	if view.ended {
-		state.paintDesktopEnded(canvas, area, session)
 	}
 	if view.chromeless && !view.fullscreen && !view.released && !view.ended {
 		state.paintDesktopCaptureNote(canvas, view, session, area)
@@ -1184,6 +1309,9 @@ func (state *State) paintDesktopPicture(d *ui.DrawContext, session *Session) {
 
 	name := fmt.Sprintf(m.Desktop.AccessibleFmt, session.Address)
 	cursor, cursorImage := view.pointerCursor(view.pixelScale)
+	if view.ended {
+		cursor, cursorImage = gfx.PointerCursorDefault, nil
+	}
 	canvas.HitWithOptions(hitTerminalList.At(int(session.ID)), area, name, gfx.HitOptions{
 		Role: gfx.RoleTerminal, Autofocus: session.ID == state.activeSessionID && !view.ended, Cursor: cursor, CursorImage: cursorImage,
 	})
@@ -1290,7 +1418,7 @@ func (state *State) desktopStripLeft(view *desktopView, session *Session) string
 	if view.width > 0 {
 		size := fmt.Sprintf(m.StripSizeFmt, view.width, view.height)
 		_, scale := view.place(view.area)
-		if view.pixelPerfect() {
+		if view.oneToOne() {
 			scale *= max(view.pixelScale, 1) // a picture drawn pixel for pixel is at 100%
 		}
 		if percent := int(math.Round(float64(scale) * 100)); percent != 100 {
@@ -1314,27 +1442,6 @@ func (state *State) desktopStripLeft(view *desktopView, session *Session) string
 		parts = append(parts, m.StripClipboard)
 	}
 	return strings.Join(parts, " · ")
-}
-
-// paintDesktopEnded dims the last picture and says the connection ended; the
-// page declares the way to start it again over it.
-func (state *State) paintDesktopEnded(canvas *gfx.Canvas, area gfx.Rect, session *Session) {
-	pal, m := state.pal, state.messages
-	canvas.Fill(area, withAlpha(pal.shell, 0.78))
-	width := min(max(area.Width-32, 120), 420)
-	x := area.X + (area.Width-width)/2
-	y := area.Y + max((area.Height-132)/2, 8)
-	canvas.Label(m.Desktop.Disconnected, gfx.Rect{X: x, Y: y, Width: width, Height: 24}, gfx.TextStyle{Size: 16, Weight: gfx.WeightSemibold, Color: pal.text})
-	reason := state.failureLine(session)
-	if session.err != nil && reason == "" {
-		reason = session.err.Error()
-	}
-	if reason != "" {
-		canvas.Label(fmt.Sprintf(m.Desktop.DisconnectedFmt, reason), gfx.Rect{X: x, Y: y + 30, Width: width, Height: 40}, gfx.TextStyle{Size: metrics.FontSizeS, Color: pal.muted})
-	}
-	if state.canReconnect(session) {
-		canvas.Label(m.Desktop.ReconnectHint, gfx.Rect{X: x, Y: y + 112, Width: width, Height: 18}, gfx.TextStyle{Size: metrics.FontSizeS, Color: pal.faint})
-	}
 }
 
 // hostSubtitle is the line under a host's name in the list: the account it signs

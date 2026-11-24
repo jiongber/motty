@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"sync/atomic"
 
-	"github.com/vivaui/viva/components"
 	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/ui"
 	"motty/internal/i18n"
@@ -75,8 +74,8 @@ func (w *remoteToolsWindow) declareWindow(c ui.C) {
 	w.ui.viewport = gfx.Size{Width: size.Width, Height: size.Height}
 	ui.Column(c).Fill().Background(pal.workspace).Children(func() {
 		w.declareTitlebar(c)
-		ui.Column(c).Grow(1).Shrink(1).PadSides(0, remoteToolsContentPad, remoteToolsContentPad, remoteToolsContentPad).Children(func() {
-			tab := w.declareToolbar(c, size)
+		ui.Container(c).Grow(1).Shrink(1).PadSides(0, remoteToolsContentPad, remoteToolsContentPad, remoteToolsContentPad).Children(func() {
+			tab := w.declareToolbar(c)
 			w.declareSearch(c)
 			w.declareTable(c, tab)
 			w.declareStatus(c, tab)
@@ -95,30 +94,25 @@ func (w *remoteToolsWindow) declareTitlebar(c ui.C) {
 }
 
 // declareToolbar declares the tab choice, the refresh controls and the sudo
-// switch. It returns the tab the paint started with: the choice writes a new tab
-// while it is declared, and the body laid out from the old one is what the rest
-// of this paint shows.
-func (w *remoteToolsWindow) declareToolbar(c ui.C, size gfx.Size) remoteTab {
+// switch, on one line once the content is wide enough for them and with the
+// controls on a line of their own under the tabs otherwise. It returns the tab
+// the paint started with: the choice writes a new tab while it is declared, and
+// the body laid out from the old one is what the rest of this paint shows.
+func (w *remoteToolsWindow) declareToolbar(c ui.C) remoteTab {
 	view := &w.ui.remote
 	tab := view.tab
-	stacked := size.Width < 800
-	ui.Row(c).Height(remoteToolbarHeight).Shrink(0).Gap(remoteToolsToolbarGap).Children(func() {
-		if ui.Choice(c, &view.tab, remoteTabChoices[:], w.ui.remoteTabLabel).Width(600).Shrink(1).FillHeight().Changed() {
-			w.ui.applyRemoteTab()
-		}
-		ui.Spacer(c)
-		if !stacked {
-			w.declareRefreshControls(c)
-			w.declareSudo(c)
-		}
-	})
-	if stacked {
-		ui.Row(c).Height(remoteToolbarHeight).Shrink(0).MarginSides(8, 0, 0, 0).Children(func() {
+	ui.Column(c).Shrink(0).Gap(8).From(ui.Width(remoteToolsInlineToolbarWidth), func(b ui.Box) { b.Row().Gap(remoteToolsToolbarGap) }).Children(func() {
+		ui.Row(c).Height(remoteToolbarHeight).Grow(1).Shrink(1).Children(func() {
+			if ui.Choice(c, &view.tab, remoteTabChoices[:], w.ui.remoteTabLabel).Width(600).Shrink(1).FillHeight().Changed() {
+				w.ui.applyRemoteTab()
+			}
+		})
+		ui.Row(c).Height(remoteToolbarHeight).Shrink(0).Children(func() {
 			ui.Spacer(c)
 			w.declareRefreshControls(c)
 			w.declareSudo(c)
 		})
-	}
+	})
 	return tab
 }
 
@@ -215,14 +209,7 @@ func (w *remoteToolsWindow) declareActions(c ui.C) {
 		for i := 0; i < count; i++ {
 			action := actions[i]
 			button := ui.Button(c, action.Label).Small().Shrink(0)
-			switch action.Variant {
-			case components.ButtonDestructive:
-				button = button.Destructive()
-			case components.ButtonSecondary:
-				button = button.Secondary()
-			default:
-				button = button.Outline()
-			}
+			button = button.Variant(remoteToolsVariant(action.Variant))
 			if action.Disabled {
 				button = button.Disabled(true)
 			}
@@ -346,7 +333,7 @@ func (w *remoteToolsWindow) declareFormDialog(c ui.C) {
 		return
 	}
 	form := &w.ui.form
-	bodyHeight := form.bodyHeight() + w.ui.formProblemHeight(c.Canvas(), form.formProblem())
+	bodyHeight := form.bodyHeight(c.Theme()) + w.ui.formProblemHeight(c.Canvas(), form.formProblem())
 	dialog := ui.Dialog(c, ui.DialogSpec{
 		Title: form.title, Description: form.description, Width: formWidth,
 		Layer: dialogLayer, Scope: dialogScope, CloseID: hitFormClose,
@@ -431,9 +418,11 @@ func (w *remoteToolsWindow) declareSudoDialog(c ui.C) {
 		DismissID: hitSudoSFTPDismiss, CloseID: hitSudoSFTPCancel, InitialFocusID: hitSudoSFTPPassword,
 	})
 	dialog.Body(func() {
-		ui.Column(c).Height(w.ui.secretFieldBody("")).PadSides(2, 4, 0, 4).Children(func() {
-			ui.TextFieldID(c, hitSudoSFTPPassword, &dialogState.field, m.SFTPSudoPassword, "").
-				Height(62).FillWidth().Secure().AutoFocus()
+		ui.Column(c).Height(sudoDialogBody(c.Theme())).PadSides(2, 4, 0, 4).Children(func() {
+			ui.FormField(c, &dialogState.row, m.SFTPSudoPassword).FillWidth().Height(dialogRowHeight(c.Theme())).Children(func() {
+				ui.TextFieldID(c, hitSudoSFTPPassword, &dialogState.field, m.SFTPSudoPassword, "").
+					FillWidth().Secure().AutoFocus()
+			})
 		})
 	})
 	dialog.Footer(func() {

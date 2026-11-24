@@ -11,6 +11,8 @@ import (
 	"github.com/vivaui/viva/app"
 	"github.com/vivaui/viva/components"
 	"github.com/vivaui/viva/gfx"
+	"github.com/vivaui/viva/keymap"
+	"github.com/vivaui/viva/text"
 	"github.com/vivaui/viva/ui"
 	"motty/internal/filecontent"
 )
@@ -155,8 +157,13 @@ func (d *fileDocument) declareEditWindow(c ui.C) {
 				if d.image == nil {
 					d.declareEncoding(c, bounds)
 				}
+				d.declareFooterProgress(c)
 				status := d.footerStatus()
-				ui.Text(c, status).FontSize(theme.Metrics.FontSizeS).Color(theme.MutedForeground).Ellipsis().LineHeight(22).Grow(1).
+				statusColor := theme.MutedForeground
+				if d.busy {
+					statusColor = theme.Foreground
+				}
+				ui.Text(c, status).FontSize(theme.Metrics.FontSizeS).Color(statusColor).Ellipsis().LineHeight(22).Grow(1).
 					HitWith(hitDocumentStatus, status, gfx.HitOptions{Role: gfx.RoleGroup, SkipFocus: true, Hint: status})
 				if d.image != nil {
 					d.pageButton(c, "fit", hitDocumentFit, m.Fit).Small().Outline()
@@ -175,7 +182,11 @@ func (d *fileDocument) declareEditWindow(c ui.C) {
 				if d.image == nil {
 					disabled := d.busy || !d.ready || !d.dirty() || d.comparison.active
 					if d.local {
-						d.pageButton(c, "save", hitDocumentSave, m.Save).Small().Disabled(disabled)
+						saveLabel := m.Save
+						if d.saving() {
+							saveLabel = m.Saving
+						}
+						d.pageButton(c, "save", hitDocumentSave, saveLabel).Small().Disabled(disabled)
 					} else {
 						d.declareSaveSplit(c, disabled)
 					}
@@ -206,7 +217,7 @@ func (d *fileDocument) declareEncoding(c ui.C, bounds gfx.Rect) {
 		ui.Text(c, m.Encoding+":").FontSize(theme.Metrics.FontSizeS).Color(theme.MutedForeground).LineHeight(22).Shrink(0).
 			Hit(hitDocumentEncodingLabel, m.Encoding)
 		selector := ui.Select(c, &d.ui.encodingChoice, d.ui.encodingChoices, d.encodingLabel).
-			Label(m.Encoding).Hit(hitDocumentEncoding, m.Encoding).Height(32).Grow(1).
+			Label(m.Encoding).Height(32).Grow(1).
 			Disabled(d.busy || d.comparison.active)
 		if d.ui.focusEncoding {
 			selector.AutoFocus()
@@ -219,6 +230,22 @@ func (d *fileDocument) declareEncoding(c ui.C, bounds gfx.Rect) {
 	})
 }
 
+// saving reports whether the document is currently waiting on an in-flight save
+// to local disk or the remote server.
+func (d *fileDocument) saving() bool {
+	return d.busy && (d.comparison.saving || d.saveInFlight)
+}
+
+// declareFooterProgress declares the spinner the footer shows while the
+// document is waiting on a save, reload or server read: the status text alone
+// read as if the work had already finished. The files panel's status row shows
+// the same spinner for its busy state.
+func (d *fileDocument) declareFooterProgress(c ui.C) {
+	if d.busy {
+		ui.Spinner(c).Size(16, 16).Shrink(0)
+	}
+}
+
 // encodingLabel names one choice of the encoding select.
 func (d *fileDocument) encodingLabel(name string) string {
 	if name == "" {
@@ -227,25 +254,29 @@ func (d *fileDocument) encodingLabel(name string) string {
 	return name
 }
 
-// declareSaveSplit declares the remote save button and the chevron that opens
-// the actions beside it, as page buttons under one row. Both keep the
-// application's own identities, so the central dispatcher handles their clicks.
+// declareSaveSplit declares the remote save action and the chevron that opens
+// the action beside it as one split button: the halves share a surface, only the
+// group's outer corners are rounded, and a hairline separates them. Both halves
+// keep the application's own identities, so the central dispatcher handles their
+// clicks.
 func (d *fileDocument) declareSaveSplit(c ui.C, disabled bool) {
 	m := d.owner.messages.FileWindow
-	theme := d.owner.Theme()
-	ui.Row(c).Gap(0).Shrink(0).Items(ui.Center).Children(func() {
-		// The split button the page replaces kept its halves at the size it was
-		// given: an 80px primary and a 32px trigger, the label in the small type
-		// the size names.
-		ui.Button(c, m.Save).Small().Width(80).Height(32).Hit(hitDocumentSave, m.Save).Disabled(disabled)
-		d.ui.saveMenuTrigger = ui.Button(c, m.SaveOptions).Icon(lucideIcons[iconChevronDown]).IconOnly().
-			Size(32, 32).Hit(hitDocumentSaveMenu, m.SaveOptions).Disabled(disabled).
-			Draw(func(part *ui.DrawContext) {
-				// The hairline the split button drew between its halves.
-				part.Canvas.Fill(gfx.Rect{X: part.Rect.X - 0.5, Y: part.Rect.Y, Width: 1, Height: part.Rect.Height}, theme.Input)
-			})
-		d.ui.saveMenuDeclared = true
-	})
+	label := m.Save
+	if d.saving() {
+		label = m.Saving
+	}
+	// The split button the page replaced kept its halves at the size it was
+	// given: an 80px primary and a 32px trigger, the label in the small type
+	// the size names.
+	save := ui.SplitButton(c, ui.SplitButtonSpec{
+		PrimaryID: hitDocumentSave, MenuID: hitDocumentSaveMenu,
+		Label: label, MenuLabel: m.SaveOptions,
+		Hint: label, MenuHint: m.SaveOptions,
+		Icon: lucideIcons[iconChevronDown], Open: d.ui.saveMenuOpen,
+	}).Small().Width(112).Height(32)
+	save = save.Disabled(disabled)
+	d.ui.saveMenuTrigger = save
+	d.ui.saveMenuDeclared = true
 }
 
 // declareSaveMenu declares the open save menu under the chevron: the actions
@@ -370,14 +401,23 @@ func (d *fileDocument) declareComparisonWindow(c ui.C) {
 			}
 			uiState.contentBox = ui.Slot(c).Grow(1).MinHeight(64)
 			ui.Row(c).Height(32).Gap(8).Items(ui.Center).Children(func() {
+				d.declareFooterProgress(c)
 				status := d.comparisonStatus()
-				ui.Text(c, status).FontSize(theme.Metrics.FontSizeS).Color(theme.MutedForeground).Ellipsis().LineHeight(22).Grow(1).
+				statusColor := theme.MutedForeground
+				if d.busy {
+					statusColor = theme.Foreground
+				}
+				ui.Text(c, status).FontSize(theme.Metrics.FontSizeS).Color(statusColor).Ellipsis().LineHeight(22).Grow(1).
 					HitWith(hitDocumentStatus, status, gfx.HitOptions{Role: gfx.RoleGroup, SkipFocus: true, Hint: status})
 				if d.comparison.conflict {
 					ui.Button(c, m.CompareRetry).Small().Outline().Hit(hitDocumentCompareRetry, m.CompareRetry).Disabled(d.busy)
 				}
 				ui.Button(c, m.ReturnToEdit).Small().Outline().Hit(hitDocumentReturnToEdit, m.ReturnToEdit).Disabled(d.busy || d.comparison.saving)
-				ui.Button(c, m.Save).Small().Hit(hitDocumentConfirmUpload, m.Save).Disabled(!d.canUploadComparison())
+				saveLabel := m.Save
+				if d.comparison.saving {
+					saveLabel = m.Saving
+				}
+				ui.Button(c, saveLabel).Small().Hit(hitDocumentConfirmUpload, saveLabel).Disabled(!d.canUploadComparison())
 			})
 		})
 	})
@@ -411,6 +451,9 @@ func (d *fileDocument) footerStatus() string {
 	position := d.positionStatus() + " · " + ending
 	if status == "" {
 		return position
+	}
+	if d.busy {
+		return status + " · " + position
 	}
 	return position + " · " + status
 }
@@ -718,6 +761,9 @@ func (d *fileDocument) key(event gfx.KeyEvent) gfx.EventResult {
 		}
 		return gfx.EventResult{}
 	}
+	if result, ok := d.clipboardShortcut(event, false); ok {
+		return result
+	}
 	if result, ok := d.codeKey(event); ok {
 		return result
 	}
@@ -735,6 +781,9 @@ func (d *fileDocument) comparisonKey(event gfx.KeyEvent) gfx.EventResult {
 			return handled
 		}
 		return gfx.EventResult{}
+	}
+	if result, ok := d.clipboardShortcut(event, true); ok {
+		return result
 	}
 	if event.Target == hitDocumentInput {
 		if command, ok := components.CodeEditorCommandForKey(event); ok && d.ready && !d.busy && command.Apply(&d.editor) {
@@ -758,6 +807,72 @@ func (d *fileDocument) comparisonKey(event gfx.KeyEvent) gfx.EventResult {
 	return gfx.EventResult{}
 }
 
+func (d *fileDocument) clipboardEditor(target gfx.ID) *text.Editor {
+	switch target {
+	case hitDocumentInput:
+		return &d.editor
+	case hitDocumentFind:
+		return &d.edit.find.Query
+	case hitDocumentReplace:
+		return &d.edit.find.Replacement
+	case hitDocumentGoTo:
+		return &d.edit.goEditor
+	default:
+		return nil
+	}
+}
+
+// clipboardShortcut handles copy and paste for the document's editor and its
+// find, replace and go-to fields. comparison selects the diff view's input and
+// caret reveal instead of the code editor's.
+func (d *fileDocument) clipboardShortcut(event gfx.KeyEvent, comparison bool) (gfx.EventResult, bool) {
+	if d.owner == nil || event.Release {
+		return gfx.EventResult{}, false
+	}
+	chord, ok := keymap.FromEvent(event)
+	if !ok {
+		return gfx.EventResult{}, false
+	}
+	action := d.owner.shortcuts.actionFor(chord)
+	if action != shortcutPaste && action != shortcutCopy {
+		return gfx.EventResult{}, false
+	}
+	if event.Repeat {
+		return gfx.EventResult{Handled: true}, true
+	}
+	context := app.TextInputContext{ID: event.Target}
+	input := d.textInput(context)
+	if comparison {
+		input = d.comparisonTextInput(context)
+	}
+	if input != nil {
+		if action == shortcutPaste {
+			if d.owner.options.ClipboardText != nil && input.OnEvent != nil {
+				value, err := d.owner.options.ClipboardText()
+				if err == nil && value != "" {
+					_, _ = input.OnEvent(app.TextEvent{Kind: app.TextPaste, Text: value})
+					if event.Target == hitDocumentInput {
+						if comparison {
+							d.comparison.ui.diff.RevealCaret(d.editor.String(), d.editor.ByteOffset(d.editor.Caret()))
+						} else {
+							d.ui.code.Reveal(d.editor.ByteOffset(d.editor.Caret()))
+						}
+					}
+					return gfx.EventResult{Handled: true, Repaint: true}, true
+				}
+			}
+			return gfx.EventResult{Handled: true}, true
+		}
+		if selected := editorSelectedText(d.clipboardEditor(event.Target)); selected != "" {
+			return gfx.EventResult{Handled: true, ClipboardText: selected}, true
+		}
+		return gfx.EventResult{Handled: true}, true
+	}
+	// Focus is outside any text input of this file window: consume copy/paste
+	// so the menu bar fallback never forwards it to the main terminal window.
+	return gfx.EventResult{Handled: true}, true
+}
+
 func (d *fileDocument) shortcut(event gfx.KeyEvent) gfx.EventResult {
 	if d.owner.noteExit != nil {
 		return gfx.EventResult{Handled: true, Repaint: true}
@@ -766,6 +881,9 @@ func (d *fileDocument) shortcut(event gfx.KeyEvent) gfx.EventResult {
 		return d.noteWindowShortcut(event)
 	}
 
+	if result, ok := d.clipboardShortcut(event, false); ok {
+		return result
+	}
 	if event.Modifiers&(gfx.ModifierControl|gfx.ModifierMeta) == 0 || event.Release {
 		return gfx.EventResult{}
 	}
@@ -786,7 +904,13 @@ func (d *fileDocument) shortcut(event gfx.KeyEvent) gfx.EventResult {
 }
 
 func (d *fileDocument) comparisonShortcut(event gfx.KeyEvent) gfx.EventResult {
-	if event.Modifiers&(gfx.ModifierControl|gfx.ModifierMeta) == 0 || event.Release || !d.comparison.active {
+	if event.Release || !d.comparison.active {
+		return gfx.EventResult{}
+	}
+	if result, ok := d.clipboardShortcut(event, true); ok {
+		return result
+	}
+	if event.Modifiers&(gfx.ModifierControl|gfx.ModifierMeta) == 0 {
 		return gfx.EventResult{}
 	}
 	if command, ok := components.CodeEditorCommandForKey(event); ok && event.Target == hitDocumentInput && d.ready && !d.busy && !d.comparison.confirm && command.Apply(&d.editor) {

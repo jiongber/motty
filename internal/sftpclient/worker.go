@@ -62,6 +62,7 @@ const (
 	OperationDownload
 	OperationUpload
 	OperationCreateDirectory
+	OperationCreateFile
 	OperationRename
 	OperationRemoveFile
 	OperationRemoveDirectory
@@ -74,6 +75,10 @@ const (
 	OperationSaveDocument
 	OperationReadDocument
 	OperationMoveSelection
+	// OperationOpenBinary and OperationSaveBinary carry a file the system's
+	// editor opens as bytes, within MaxExternalEditBytes.
+	OperationOpenBinary
+	OperationSaveBinary
 	// OperationRemoteCopy copies files from another server into this worker's
 	// server. The source is read through its own subsystem opener; the data
 	// never goes through this computer's disk.
@@ -194,8 +199,13 @@ type Result struct {
 	Owner, Group string
 	Bytes        int64
 	Files        int
-	Resumed      int64
-	Document     TextDocument
+	// Removed and Failures describe a removal: how many entries left the
+	// server, and how many a forced removal could not delete. A forced
+	// removal keeps going after a failure, so both can be non-zero.
+	Removed  int
+	Failures int
+	Resumed  int64
+	Document TextDocument
 	// Approximate marks a listing read from `ls` output because the server has
 	// no SFTP: names are exact, times and link details may not be.
 	Approximate bool
@@ -243,14 +253,18 @@ type RemoteCopyRequest struct {
 }
 
 type request struct {
-	sources     []string
-	listID      uint64
-	data        []byte
-	id          uint64
-	background  bool // a listing nobody is waiting on: its Result says so
-	namesOnly   bool // a listing for path completion: names and the directory bit
-	operation   Operation
-	remote      string
+	sources    []string
+	listID     uint64
+	data       []byte
+	id         uint64
+	background bool // a listing nobody is waiting on: its Result says so
+	namesOnly  bool // a listing for path completion: names and the directory bit
+	operation  Operation
+	remote     string
+	// force makes a removal keep going after an entry fails and treat an
+	// entry that was already gone as removed. It is the panel's forced
+	// delete, not a permission bypass: the server still decides every unlink.
+	force       bool
 	local       string
 	destination string
 	mode        os.FileMode
@@ -261,6 +275,9 @@ type request struct {
 	utf8BOM     bool
 	recursive   bool
 	policy      ExistingPolicy
+	// limit is how many bytes a document read may return; the caller sizes it
+	// from the preview setting.
+	limit int
 	// trusted is how many leading bytes of an interrupted upload's partial
 	// file this process wrote in an earlier attempt. The worker resumes from
 	// there without reading those bytes back to verify them.
@@ -524,6 +541,11 @@ func (worker *Worker) CreateDirectory(remotePath string) bool {
 	return worker.enqueue(request{operation: OperationCreateDirectory, remote: remotePath})
 }
 
+// CreateFile creates an empty file at remotePath.
+func (worker *Worker) CreateFile(remotePath string) bool {
+	return worker.enqueue(request{operation: OperationCreateFile, remote: remotePath})
+}
+
 // CreateDirectories creates a matching navigation path, including missing
 // parents. It is queued only after the application confirms that creation.
 func (worker *Worker) CreateDirectories(remotePath string) bool {
@@ -543,8 +565,21 @@ func (worker *Worker) RemoveFile(remotePath string) bool {
 	return worker.enqueue(request{operation: OperationRemoveFile, remote: remotePath})
 }
 
+// RemoveFileForce removes one file with the semantics of rm -f: a file that is
+// already gone is not an error. Other failures are still reported.
+func (worker *Worker) RemoveFileForce(remotePath string) bool {
+	return worker.enqueue(request{operation: OperationRemoveFile, remote: remotePath, force: true})
+}
+
 func (worker *Worker) RemoveDirectory(remotePath string) bool {
 	return worker.enqueue(request{operation: OperationRemoveDirectory, remote: remotePath})
+}
+
+// RemoveDirectoryForce removes a folder with the semantics of rm -rf: the walk
+// keeps going after an entry fails, and entries that are already gone are not
+// errors. The result says how many entries were removed and how many failed.
+func (worker *Worker) RemoveDirectoryForce(remotePath string) bool {
+	return worker.enqueue(request{operation: OperationRemoveDirectory, remote: remotePath, force: true})
 }
 
 // Symlink creates a symbolic link at linkPath that points at target.
@@ -584,8 +619,9 @@ func (worker *Worker) OpenText(remotePath string) bool {
 }
 
 // OpenDocument reads bounded raw bytes without treating an image as UTF-8.
-func (worker *Worker) OpenDocument(remotePath string) bool {
-	return worker.enqueue(request{operation: OperationOpenDocument, remote: remotePath})
+// limit is the caller's bound on the document.
+func (worker *Worker) OpenDocument(remotePath string, limit int) bool {
+	return worker.enqueue(request{operation: OperationOpenDocument, remote: remotePath, limit: limit})
 }
 
 // ReadDocument reads the current bounded text bytes for comparison without
@@ -596,12 +632,24 @@ func (worker *Worker) ReadDocument(remotePath string) bool {
 }
 
 // SaveDocument replaces a revision-checked document without reinterpreting its
-// bytes. Encoding and image/text policy belong to the document editor.
-func (worker *Worker) SaveDocument(remotePath string, data []byte, revision Revision) bool {
-	if len(data) > MaxPreviewFileBytes {
-		return false
-	}
-	return worker.enqueue(request{operation: OperationSaveDocument, remote: remotePath, data: append([]byte(nil), data...), revision: revision})
+// bytes. Encoding and image/text policy belong to the document editor; limit is
+// the bound its window was opened under, checked when the server copy is read
+// back for the revision comparison.
+func (worker *Worker) SaveDocument(remotePath string, data []byte, revision Revision, limit int) bool {
+	return worker.enqueue(request{operation: OperationSaveDocument, remote: remotePath, data: append([]byte(nil), data...), revision: revision, limit: limit})
+}
+
+// OpenBinary reads one remote file as bytes, for the system's editor, when it
+// is not text the built-in editor takes. The file's revision is the SHA-256 of
+// the bytes returned.
+func (worker *Worker) OpenBinary(remotePath string) bool {
+	return worker.enqueue(request{operation: OperationOpenBinary, remote: remotePath})
+}
+
+// SaveBinary replaces a file opened with OpenBinary when the server's copy still
+// has revision. The result carries the bytes that were saved.
+func (worker *Worker) SaveBinary(remotePath string, data []byte, revision Revision) bool {
+	return worker.enqueue(request{operation: OperationSaveBinary, remote: remotePath, data: append([]byte(nil), data...), revision: revision})
 }
 
 // SaveText atomically replaces one previously opened remote text file when its
@@ -1303,6 +1351,8 @@ func (worker *Worker) execute(next request) Result {
 		} else {
 			result.Err = createDirectory(client, next.remote)
 		}
+	case OperationCreateFile:
+		result.Err = createFile(client, next.remote)
 	case OperationRename:
 		result.Err = rename(client, next.remote, next.destination)
 	case OperationMoveSelection:
@@ -1320,9 +1370,24 @@ func (worker *Worker) execute(next request) Result {
 		}
 		result.Err = errors.Join(failures...)
 	case OperationRemoveFile:
-		result.Err = removeFile(client, next.remote)
+		removed, err := removeFile(client, next.remote, next.force)
+		if removed {
+			result.Removed = 1
+		}
+		if err != nil {
+			result.Failures = 1
+		}
+		result.Err = err
 	case OperationRemoveDirectory:
-		result.Err = worker.removeDirectory(client, next.remote, generation)
+		removed, err := worker.removeDirectory(client, next.remote, next.force, generation)
+		result.Removed = removed
+		var partial *PartialRemoveError
+		if errors.As(err, &partial) {
+			result.Failures = partial.Failed
+		} else if err != nil {
+			result.Failures = 1
+		}
+		result.Err = err
 	case OperationChmod:
 		result.Err = chmod(client, next.remote, next.mode)
 	case OperationChown:
@@ -1334,11 +1399,18 @@ func (worker *Worker) execute(next request) Result {
 	case OperationSaveText:
 		result.Document, result.Err = worker.saveText(client, next.remote, next.text, next.revision, next.utf8BOM, generation)
 	case OperationOpenDocument:
-		result.Data, result.Err = worker.readFileBytes(client, next.remote, generation, MaxPreviewFileBytes)
+		result.Data, result.Err = worker.readFileBytes(client, next.remote, generation, next.limit)
 	case OperationReadDocument:
 		result.Data, result.Err = worker.readFileBytes(client, next.remote, generation, MaxEditFileBytes)
+	case OperationOpenBinary:
+		result.Data, result.Err = worker.readFileBytes(client, next.remote, generation, MaxExternalEditBytes)
+	case OperationSaveBinary:
+		result.Err = worker.replaceDocumentBytes(client, next.remote, next.data, next.revision, MaxExternalEditBytes, generation)
+		if result.Err == nil {
+			result.Data = next.data
+		}
 	case OperationSaveDocument:
-		result.Err = worker.replaceDocumentBytes(client, next.remote, next.data, next.revision, generation)
+		result.Err = worker.replaceDocumentBytes(client, next.remote, next.data, next.revision, next.limit, generation)
 		if result.Err == nil {
 			result.Data = next.data
 		}
@@ -1480,6 +1552,10 @@ func (worker *Worker) resolveLinks(job linkJob) {
 	if worker.canceled(job.generation) {
 		return
 	}
+	// Resolving a link can reveal that it points at a folder. The listing's
+	// order puts folders first, so the follow-up has to be ordered again now
+	// that those links are known.
+	sortEntries(job.entries)
 	worker.publish(Result{
 		ListID:     job.listID,
 		Background: job.background, Operation: OperationList, Path: job.directory,
@@ -1534,6 +1610,15 @@ func entriesFrom(infos []os.FileInfo) []Entry {
 		}
 		entries = append(entries, entry)
 	}
+	sortEntries(entries)
+	return entries
+}
+
+// sortEntries orders a listing the way the file panel shows it: folders first,
+// then by name. A symbolic link counts as a folder once describeLinks found
+// that its target is one, so the follow-up that carries the resolved links is
+// ordered again.
+func sortEntries(entries []Entry) {
 	slices.SortFunc(entries, func(left, right Entry) int {
 		if left.IsDir() != right.IsDir() {
 			if left.IsDir() {
@@ -1543,7 +1628,6 @@ func entriesFrom(infos []os.FileInfo) []Entry {
 		}
 		return strings.Compare(left.Name, right.Name)
 	})
-	return entries
 }
 
 func (worker *Worker) upload(client Remote, next request, generation uint64) (files int, bytes, resumed int64, err error) {
@@ -1599,6 +1683,12 @@ func (worker *Worker) upload(client Remote, next request, generation uint64) (fi
 		}
 		if item.directory {
 			if err := ensureRemoteDirectory(advanced, remotePath); err != nil {
+				return 0, 0, 0, err
+			}
+			continue
+		}
+		if item.link != "" {
+			if err := putRemoteLink(advanced, remotePath, item.link, next.policy); err != nil {
 				return 0, 0, 0, err
 			}
 			continue
@@ -1756,12 +1846,14 @@ func (worker *Worker) legacyUpload(client Remote, localPath, remotePath string, 
 
 // localPlanItem is one entry a local directory upload will move, with the
 // local path and the slash-separated path it takes below the transfer root. A
-// directory's plan is in walk order, so a parent precedes its children.
+// directory's plan is in walk order, so a parent precedes its children. A
+// symbolic link inside the directory carries its target text in link.
 type localPlanItem struct {
 	local     string
 	relative  string
 	info      os.FileInfo
 	directory bool
+	link      string
 }
 
 // planLocal validates a local source and lists what an upload moves. A single
@@ -1808,7 +1900,13 @@ func planLocal(localPath string, recursive bool) (os.FileInfo, []localPlanItem, 
 			return infoErr
 		}
 		if entryInfo.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("%w: %s", ErrSymbolicLink, current)
+			// WalkDir does not follow it; the link travels as the text it holds.
+			target, linkErr := os.Readlink(current)
+			if linkErr != nil {
+				return linkErr
+			}
+			plan = append(plan, localPlanItem{local: current, relative: relative, info: entryInfo, link: target})
+			return nil
 		}
 		if !entryInfo.IsDir() && !entryInfo.Mode().IsRegular() {
 			return fmt.Errorf("sftp: unsupported local file type: %s", current)
@@ -1834,11 +1932,11 @@ func scanLocal(localPath string, recursive bool) (os.FileInfo, int, int64, error
 	return info, files, bytes, nil
 }
 
-// planTotals counts the files and bytes a plan moves. Directories take no
-// bytes of their own.
+// planTotals counts the files and bytes a plan moves. Directories and links
+// take no bytes of their own.
 func planTotals(plan []localPlanItem) (files int, bytes int64) {
 	for _, item := range plan {
-		if !item.directory {
+		if !item.directory && item.link == "" {
 			files++
 			bytes += item.info.Size()
 		}
@@ -1998,9 +2096,14 @@ func (worker *Worker) uploadStream(client transferRemote, openSource func() (io.
 		return written, resumed, err
 	}
 	closed = true
+	// The bytes are already on the server. Carrying the source permissions over
+	// is a courtesy that servers fronting an account through a gateway often
+	// refuse with a generic failure; OpenSSH's sftp does not fail a put for it
+	// either. A refusal leaves the server's default mode and the upload goes
+	// on; a timeout is fatal because the subsystem was discarded to end it.
 	if err := worker.finalizeUpload(generation, transferID, "chmod", func() error {
 		return client.Chmod(partial, sourceInfo.Mode().Perm())
-	}); err != nil {
+	}); errors.Is(err, ErrUploadFinalizeTimeout) {
 		return written, resumed, err
 	}
 	if timer, ok := client.(remoteChtimes); ok && worker.preserveTimes() {
@@ -2088,7 +2191,7 @@ func (worker *Worker) remoteCopy(destination Remote, next request, generation ui
 			return 0, 0, 0, fmt.Errorf("sftp: transfer exceeds %d items", maxTransferItems)
 		}
 		for _, item := range items {
-			if !item.directory {
+			if !item.directory && item.link == "" {
 				totalFiles++
 			}
 		}
@@ -2122,6 +2225,12 @@ func (worker *Worker) remoteCopy(destination Remote, next request, generation ui
 					if err := ensureRemoteDirectory(client, targetPath); err != nil {
 						return files, bytes, resumed, err
 					}
+				}
+				continue
+			}
+			if item.link != "" {
+				if err := putRemoteLink(client, targetPath, item.link, next.policy); err != nil {
+					return files, bytes, resumed, err
 				}
 				continue
 			}
@@ -2219,7 +2328,12 @@ func (worker *Worker) finalizeUpload(generation, transferID uint64, stage string
 	defer timer.Stop()
 	select {
 	case err := <-done:
-		return err
+		if err != nil {
+			// Name the request that failed: a gateway's generic failure status
+			// otherwise cannot be told apart between close, rename and the rest.
+			return fmt.Errorf("sftp %s: %w", stage, err)
+		}
+		return nil
 	case <-timer.C:
 		worker.interruptIfAlone(generation, transferID)
 		return fmt.Errorf("%w: %s did not answer within %s", ErrUploadFinalizeTimeout, stage, timeout)
@@ -2247,7 +2361,7 @@ func (worker *Worker) download(client Remote, next request, generation uint64) (
 	}
 	totalFiles := 0
 	for index := range plan {
-		if !plan[index].directory {
+		if !plan[index].directory && plan[index].link == "" {
 			totalFiles++
 		}
 	}
@@ -2275,6 +2389,12 @@ func (worker *Worker) download(client Remote, next request, generation uint64) (
 			}
 			continue
 		}
+		if item.link != "" {
+			if err := putLocalLink(localPath, item.link, next.policy); err != nil {
+				return files, bytes, resumed, err
+			}
+			continue
+		}
 		written, continued, err := worker.downloadFile(advanced, item.remote, localPath, item.mode, item.modTime, item.size, next.policy, generation, next.id, files, bytes)
 		bytes += written
 		resumed += continued
@@ -2294,6 +2414,9 @@ type remotePlanItem struct {
 	modTime   time.Time
 	size      int64
 	directory bool
+	// link is the target text of a symbolic link inside the folder; the link
+	// is recreated at the other end and never followed.
+	link string
 }
 
 func scanRemote(client transferRemote, remotePath string, recursive bool) ([]remotePlanItem, int64, error) {
@@ -2334,7 +2457,23 @@ func scanRemote(client transferRemote, remotePath string, recursive bool) ([]rem
 				return fmt.Errorf("%w: %q", ErrPathTraversal, name)
 			}
 			if child.Mode()&os.ModeSymlink != 0 {
-				return fmt.Errorf("%w: %s", ErrSymbolicLink, path.Join(current, name))
+				links, ok := client.(remoteLinkStore)
+				if !ok {
+					return fmt.Errorf("%w: %s", ErrSymbolicLink, path.Join(current, name))
+				}
+				childRemote, err := joinRemoteWithin(root, path.Join(relative, name))
+				if err != nil {
+					return err
+				}
+				target, err := links.ReadLink(childRemote)
+				if err != nil {
+					return err
+				}
+				plan = append(plan, remotePlanItem{remote: childRemote, relative: path.Join(relative, name), mode: child.Mode(), modTime: child.ModTime(), link: target})
+				if len(plan) > maxTransferItems {
+					return fmt.Errorf("sftp: directory exceeds %d transfer items", maxTransferItems)
+				}
+				continue
 			}
 			childRemote, err := joinRemoteWithin(root, path.Join(relative, name))
 			if err != nil {
@@ -2803,9 +2942,156 @@ func (worker *Worker) uploadPipelinedTo(destination io.WriterAt, source io.Reade
 	return pipeline.run(sink)
 }
 
-// uploadCopy moves a local file to a remote writer. A destination that takes
-// writes at offsets, which is every SFTP file, gets the sliding window; any other
-// is written sequentially.
+// concurrentReaderFrom is implemented by *sftp.File. Unlike calling WriteAt
+// from many goroutines, ReadFromWithConcurrency dispatches every SSH_FXP_WRITE
+// packet from one goroutine in strictly ascending offset order while keeping a
+// sliding window of requests in flight.
+type concurrentReaderFrom interface {
+	ReadFromWithConcurrency(io.Reader, int) (int64, error)
+}
+
+type orderedUploadReader struct {
+	worker     *Worker
+	source     io.Reader
+	generation uint64
+	transferID uint64
+	sink       progressSink
+	stop       <-chan struct{}
+
+	readMu     sync.Mutex
+	readBytes  int64
+	reported   int64
+	lastNotify time.Time
+}
+
+func (r *orderedUploadReader) Read(p []byte) (int, error) {
+	if r.transferID != 0 {
+		if !r.worker.holdWhilePaused(r.generation, r.transferID) {
+			return 0, ErrCanceled
+		}
+	} else if r.worker.canceled(r.generation) {
+		return 0, ErrCanceled
+	}
+	r.readMu.Lock()
+	defer r.readMu.Unlock()
+	select {
+	case <-r.stop:
+		return 0, ErrCanceled
+	default:
+	}
+	n, err := r.source.Read(p)
+	if n > 0 {
+		r.readBytes += int64(n)
+		if r.transferID != 0 {
+			if now := r.worker.clock(); now.Sub(r.lastNotify) >= progressFrameInterval {
+				r.lastNotify = now
+				delta := r.readBytes - r.reported
+				r.reported = r.readBytes
+				r.sink.addBytes(delta)
+			}
+		}
+	}
+	return n, err
+}
+
+// uploadOrderedTo uploads through ReadFromWithConcurrency so SSH_FXP_WRITE
+// packets leave the client in strictly ascending offset order (as FileZilla and
+// OpenSSH sftp send them) while keeping uploadWindow requests pipelined.
+func (worker *Worker) uploadOrderedTo(destination concurrentReaderFrom, seeker io.Seeker, source io.Reader, generation, transferID uint64, resumed int64, sink progressSink) (int64, error) {
+	stop := make(chan struct{})
+	var stopOnce sync.Once
+	halt := func() { stopOnce.Do(func() { close(stop) }) }
+	reader := &orderedUploadReader{
+		worker:     worker,
+		source:     source,
+		generation: generation,
+		transferID: transferID,
+		sink:       sink,
+		stop:       stop,
+		lastNotify: worker.clock(),
+	}
+	type result struct {
+		read int64
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		n, err := destination.ReadFromWithConcurrency(reader, uploadWindow)
+		done <- result{read: n, err: err}
+	}()
+
+	var (
+		res       result
+		finished  bool
+		aborted   bool
+		abandoned bool
+		grace     <-chan time.Time
+		abandon   <-chan time.Time
+	)
+	wake := worker.wakeChannel()
+	check := true
+	for !finished && !abandoned {
+		if check && !aborted {
+			check = false
+			if worker.stopped(generation, transferID) {
+				aborted = true
+				halt()
+				timer := time.NewTimer(worker.cancelGrace)
+				defer timer.Stop()
+				grace = timer.C
+			}
+		}
+		select {
+		case res = <-done:
+			finished = true
+		case <-wake:
+			wake = worker.wakeChannel()
+			check = true
+		case <-grace:
+			grace = nil
+			if worker.interruptIfAlone(generation, transferID) {
+				timer := time.NewTimer(worker.cancelGrace)
+				defer timer.Stop()
+				abandon = timer.C
+			}
+		case <-abandon:
+			abandoned = true
+		}
+	}
+	halt()
+	if abandoned {
+		// Wait for any in-flight source.Read to finish before the caller closes
+		// source; stop is already closed so no later Read can touch source.
+		reader.readMu.Lock()
+		reported := reader.reported
+		reader.readMu.Unlock()
+		if transferID != 0 && reported > 0 {
+			sink.addBytes(-reported)
+		}
+		return 0, errors.Join(ErrCanceled, errUploadAbandoned)
+	}
+	confirmed := res.read
+	if res.err != nil {
+		confirmed = 0
+		if seeker != nil {
+			if pos, seekErr := seeker.Seek(0, io.SeekCurrent); seekErr == nil && pos >= resumed {
+				confirmed = pos - resumed
+			}
+		}
+	}
+	if transferID != 0 {
+		sink.addBytes(confirmed - reader.reported)
+	}
+	if aborted {
+		return confirmed, ErrCanceled
+	}
+	return confirmed, res.err
+}
+
+// uploadCopy moves a local file to a remote writer. A real SFTP file uses
+// ReadFromWithConcurrency so pipelined writes are dispatched in ascending
+// offset order; other WriterAt destinations use the sliding window pipeline,
+// and plain writers fall back to sequential copy.
 func (worker *Worker) uploadCopy(destination io.Writer, source io.Reader, generation, transferID uint64, filesDone int, bytesBefore, resumed int64) (int64, error) {
 	sink := newFileSink(worker, transferID, filesDone, bytesBefore)
 	sink.addResumed(resumed)
@@ -2813,6 +3099,10 @@ func (worker *Worker) uploadCopy(destination io.Writer, source io.Reader, genera
 }
 
 func (worker *Worker) uploadCopyTo(destination io.Writer, source io.Reader, generation, transferID uint64, resumed int64, sink progressSink) (int64, error) {
+	if ordered, ok := destination.(concurrentReaderFrom); ok {
+		seeker, _ := destination.(io.Seeker)
+		return worker.uploadOrderedTo(ordered, seeker, source, generation, transferID, resumed, sink)
+	}
 	if writerAt, ok := destination.(io.WriterAt); ok {
 		return worker.uploadPipelinedTo(writerAt, source, generation, transferID, resumed, sink)
 	}
@@ -3331,6 +3621,46 @@ func createDirectory(client Remote, remotePath string) error {
 	return err
 }
 
+func createFile(client Remote, remotePath string) error {
+	if remotePath == "" {
+		return fmt.Errorf("sftp: create file requires a remote path")
+	}
+	if linker, ok := client.(remoteLinker); ok {
+		if _, statErr := linker.Lstat(remotePath); statErr == nil {
+			return fmt.Errorf("%w: %s", ErrDestinationExists, remotePath)
+		}
+	} else if _, statErr := client.ReadDir(remotePath); statErr == nil {
+		return fmt.Errorf("%w: %s", ErrDestinationExists, remotePath)
+	}
+	if fileCreator, ok := client.(interface{ CreateFile(string) error }); ok {
+		err := fileCreator.CreateFile(remotePath)
+		if err != nil {
+			// The path appeared after the check above: that is an existing
+			// destination, not a failure of the server.
+			if linker, ok := client.(remoteLinker); ok {
+				if _, statErr := linker.Lstat(remotePath); statErr == nil {
+					return fmt.Errorf("%w: %s", ErrDestinationExists, remotePath)
+				}
+			}
+		}
+		return err
+	}
+	creator, ok := client.(remoteCreator)
+	if !ok {
+		return fmt.Errorf("sftp: create file is not supported by the remote")
+	}
+	file, err := creator.Create(remotePath)
+	if err != nil {
+		if linker, ok := client.(remoteLinker); ok {
+			if _, statErr := linker.Lstat(remotePath); statErr == nil {
+				return fmt.Errorf("%w: %s", ErrDestinationExists, remotePath)
+			}
+		}
+		return err
+	}
+	return file.Close()
+}
+
 func createDirectories(client Remote, remotePath string) error {
 	if remotePath == "" {
 		return errors.New("sftp: create directories requires a remote path")
@@ -3381,15 +3711,51 @@ func rename(client Remote, oldPath, newPath string) error {
 	return renamer.Rename(oldPath, newPath)
 }
 
-func removeFile(client Remote, remotePath string) error {
+// PartialRemoveError says a forced removal deleted what it could, but could not
+// delete every entry. Failed counts entries, not only the top-level paths the
+// caller selected.
+type PartialRemoveError struct {
+	Failed int
+	First  error
+}
+
+func (err *PartialRemoveError) Error() string {
+	if err.First == nil {
+		return fmt.Sprintf("sftp: %d items could not be removed", err.Failed)
+	}
+	return fmt.Sprintf("sftp: %d items could not be removed: %v", err.Failed, err.First)
+}
+
+func (err *PartialRemoveError) Unwrap() error { return err.First }
+
+// errRemoveLimit stops a tree walk that is larger than the worker will delete.
+// Even a forced removal must not keep walking an unbounded tree or a loop.
+var errRemoveLimit = errors.New("sftp: removal tree is too large")
+
+// IsFatalRemoveError reports whether a removal error must stop a forced queue:
+// cancellation, a path that escaped the selected tree, or the work limit.
+func IsFatalRemoveError(err error) bool {
+	return errors.Is(err, ErrCanceled) || errors.Is(err, ErrPathTraversal) || errors.Is(err, errRemoveLimit)
+}
+
+func removeFile(client Remote, remotePath string, force bool) (bool, error) {
 	if remotePath == "" {
-		return fmt.Errorf("sftp: remove file requires a remote path")
+		return false, fmt.Errorf("sftp: remove file requires a remote path")
 	}
 	remover, ok := client.(remoteFileRemover)
 	if !ok {
-		return fmt.Errorf("sftp: remove file is not supported by the remote")
+		return false, fmt.Errorf("sftp: remove file is not supported by the remote")
 	}
-	return remover.Remove(remotePath)
+	err := remover.Remove(remotePath)
+	if err == nil {
+		return true, nil
+	}
+	// rm -f treats a path that is already gone as removed. The row still has
+	// to leave the listing, and the caller has nothing left to retry.
+	if force && IsPathNotFound(err) {
+		return true, nil
+	}
+	return false, err
 }
 
 // maxRemoveDepth bounds the tree a directory removal walks. A server that
@@ -3401,9 +3767,12 @@ const maxRemoveDepth = 96
 // plain rmdir and refuses a folder that is not empty, so the tree is walked here:
 // each folder on the way down is listed, its files are removed, its folders are
 // emptied the same way, and the folder itself goes last.
-func (worker *Worker) removeDirectory(client Remote, remotePath string, generation uint64) error {
+//
+// A normal removal stops at the first failure. A forced one keeps going and
+// returns a PartialRemoveError that says how many entries were left behind.
+func (worker *Worker) removeDirectory(client Remote, remotePath string, force bool, generation uint64) (int, error) {
 	if remotePath == "" {
-		return fmt.Errorf("sftp: remove directory requires a remote path")
+		return 0, fmt.Errorf("sftp: remove directory requires a remote path")
 	}
 	// What was asked for may be a link to a folder: a listing of it would be the
 	// listing of the folder it points at, and emptying that is not what the user
@@ -3411,43 +3780,64 @@ func (worker *Worker) removeDirectory(client Remote, remotePath string, generati
 	// or fails to say, does not get the benefit of the doubt: nothing is walked.
 	linker, ok := client.(remoteLinker)
 	if !ok {
-		return fmt.Errorf("sftp: remove directory is not supported by the remote")
+		return 0, fmt.Errorf("sftp: remove directory is not supported by the remote")
 	}
 	info, err := linker.Lstat(remotePath)
 	if err != nil {
-		return err
+		if force && IsPathNotFound(err) {
+			return 1, nil
+		}
+		return 0, err
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
-		return removeFile(client, remotePath)
+		removed, err := removeFile(client, remotePath, force)
+		if removed {
+			return 1, err
+		}
+		return 0, err
 	}
 	remover, ok := client.(remoteDirectoryRemover)
 	if !ok {
-		return fmt.Errorf("sftp: remove directory is not supported by the remote")
+		return 0, fmt.Errorf("sftp: remove directory is not supported by the remote")
 	}
 	items := 0
-	return worker.removeTree(client, remotePath, remover, generation, 0, &items)
+	removed, failed, firstErr := worker.removeTree(client, remotePath, remover, generation, force, 0, &items)
+	if firstErr != nil && IsFatalRemoveError(firstErr) {
+		return removed, firstErr
+	}
+	if failed > 0 && force {
+		return removed, &PartialRemoveError{Failed: failed, First: firstErr}
+	}
+	if firstErr != nil {
+		return removed, firstErr
+	}
+	return removed, nil
 }
 
 // removeTree empties one folder and then removes it. items counts everything
-// removed so far across the whole walk.
-func (worker *Worker) removeTree(client Remote, remotePath string, remover remoteDirectoryRemover, generation uint64, depth int, items *int) error {
+// attempted across the whole walk, so the work stays bounded even if entries
+// keep failing. removed and failed count entries that left the server and
+// entries that could not; a normal removal returns at the first failure.
+func (worker *Worker) removeTree(client Remote, remotePath string, remover remoteDirectoryRemover, generation uint64, force bool, depth int, items *int) (removed int, failed int, firstErr error) {
 	if depth > maxRemoveDepth {
-		return fmt.Errorf("sftp: %s is nested deeper than %d folders", remotePath, maxRemoveDepth)
+		return 0, 0, fmt.Errorf("%w: %s is nested deeper than %d folders", errRemoveLimit, remotePath, maxRemoveDepth)
 	}
 	infos, err := client.ReadDir(remotePath)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			// It vanished under us: there is nothing left to remove.
-			return nil
+		if IsPathNotFound(err) {
+			// It vanished under us: there is nothing left to remove, and the
+			// already-gone folder is one entry the removal does not have to
+			// retry.
+			return 1, 0, nil
 		}
 		// The folder cannot be read, so what is in it is unknown. Report why it
 		// could not be listed, not the server's "not empty" to removing it
 		// anyway, and lead with the cause so a status line that cuts the long
 		// path still shows it. An empty folder that merely cannot be listed goes.
 		if removeErr := remover.RemoveDirectory(remotePath); removeErr != nil {
-			return fmt.Errorf("sftp: %w, cannot list %s", err, remotePath)
+			return 0, 1, fmt.Errorf("sftp: %w, cannot list %s", err, remotePath)
 		}
-		return nil
+		return 1, 0, nil
 	}
 	for _, info := range infos {
 		if info == nil {
@@ -3456,31 +3846,63 @@ func (worker *Worker) removeTree(client Remote, remotePath string, remover remot
 		// A tree of any size is started and stopped by the user, so the walk
 		// asks between entries rather than finishing a folder it no longer wants.
 		if worker.canceled(generation) {
-			return ErrCanceled
+			return removed, failed, ErrCanceled
 		}
 		name := info.Name()
 		if !safeRemoteName(name) {
-			return fmt.Errorf("%w: %q", ErrPathTraversal, name)
+			return removed, failed, fmt.Errorf("%w: %q", ErrPathTraversal, name)
 		}
 		*items++
 		if *items > maxTransferItems {
-			return fmt.Errorf("sftp: %s holds more than %d items", remotePath, maxTransferItems)
+			return removed, failed, fmt.Errorf("%w: %s holds more than %d items", errRemoveLimit, remotePath, maxTransferItems)
 		}
 		child := path.Join(remotePath, name)
 		// A link is removed as a link, never followed: its target is elsewhere.
 		if info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
-			err = worker.removeTree(client, child, remover, generation, depth+1, items)
+			childRemoved, childFailed, err := worker.removeTree(client, child, remover, generation, force, depth+1, items)
+			removed += childRemoved
+			failed += childFailed
+			if err != nil {
+				fatal := IsFatalRemoveError(err)
+				if firstErr == nil {
+					firstErr = err
+				}
+				if !force || fatal {
+					return removed, failed, err
+				}
+			}
+			continue
+		}
+		childRemoved, err := removeFile(client, child, force)
+		if childRemoved {
+			removed++
 		} else {
-			err = removeFile(client, child)
+			failed++
 		}
 		if err != nil {
-			return err
+			if firstErr == nil {
+				firstErr = err
+			}
+			if !force {
+				return removed, failed, err
+			}
 		}
 	}
 	if worker.canceled(generation) {
-		return ErrCanceled
+		return removed, failed, ErrCanceled
 	}
-	return remover.RemoveDirectory(remotePath)
+	if err := remover.RemoveDirectory(remotePath); err != nil {
+		failed++
+		if firstErr == nil {
+			firstErr = err
+		}
+		if !force {
+			return removed, failed, err
+		}
+		return removed, failed, firstErr
+	}
+	removed++
+	return removed, failed, nil
 }
 
 func chmod(client Remote, remotePath string, mode os.FileMode) error {

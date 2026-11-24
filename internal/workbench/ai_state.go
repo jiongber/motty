@@ -168,7 +168,10 @@ type aiState struct {
 	items          []aiItem
 	history        []llm.Message
 	conv           int64
-	input          text.Editor
+	// session names the conversation to providers that route on it; it is
+	// made on the first question and dropped with the conversation.
+	session string
+	input   text.Editor
 	// attachments wait in the message box for the next question; attaching is how
 	// many files are still being read for it.
 	attachments []aiAttachment
@@ -215,6 +218,9 @@ type aiState struct {
 	mcpAddr, mcpToken string
 	// agentAudit is the latest calls agents made without the window.
 	agentAudit []store.AuditEntry
+	// agentTransferRoots are the local directories the stdio server may
+	// transfer files within.
+	agentTransferRoots []string
 	// agentSummary caches what the page shows about them.
 	agentSummary agentSummary
 	// cfg is the settings section's own state (ai_settings.go).
@@ -366,6 +372,8 @@ func (state *State) reloadAISettings() {
 	read("ai.mcp.enabled", func(v string) { settings.mcpEnabled = v == "on" })
 	read("ai.mcp.mode", func(v string) { settings.mcpMode = mcpModeFromSetting(v) })
 	read(agentModeSetting, func(v string) { settings.agentMode = mcpModeFromSetting(v) })
+	var transferRoots []string
+	read(agentTransferRootsSetting, func(v string) { transferRoots = parseTransferRoots(v) })
 	// Export client choices live beside the settings in ai.db but not in
 	// aiSettings: they change which configuration the page shows, not what the
 	// assistant or the MCP servers do.
@@ -378,6 +386,7 @@ func (state *State) reloadAISettings() {
 	}
 	if !failed {
 		ai.settings = settings
+		ai.agentTransferRoots = transferRoots
 	}
 	// Model reasoning settings can change in another window while this panel stays open.
 	if models, err := ai.store.Models(); err == nil {
@@ -913,9 +922,13 @@ func (state *State) aiSend() bool {
 	}
 	state.aiMessagesToEnd()
 
+	if ai.session == "" {
+		ai.session = llm.NewSessionID()
+	}
 	config := agent.Config{
 		Provider:          state.aiProvider(provider),
 		Model:             model,
+		SessionID:         ai.session,
 		System:            agent.DefaultSystem(state.aiSessionSummary(references...)) + state.aiNoSessionNote(references...),
 		Mode:              ai.mode,
 		UserInHistory:     retry,
@@ -1367,7 +1380,7 @@ func (state *State) aiNewConversation() {
 	ai.target, ai.extras, ai.targetSet = gate.SessionInfo{}, nil, false
 	ai.panel.targetOpen = false
 	ai.panel.autoMenu = false
-	ai.items, ai.history, ai.conv, ai.notice = nil, nil, 0, ""
+	ai.items, ai.history, ai.conv, ai.session, ai.notice = nil, nil, 0, "", ""
 	ai.noteMentions, ai.requestNoteReferences = nil, nil
 	state.aiClearAttachments()
 	ai.approvals = nil
@@ -1394,7 +1407,7 @@ func (state *State) aiOpenConversation(id int64) {
 		ai.notice = err.Error()
 		return
 	}
-	ai.items, ai.history, ai.conv = nil, nil, id
+	ai.items, ai.history, ai.conv, ai.session = nil, nil, id, ""
 	ai.noteMentions, ai.requestNoteReferences = nil, nil
 	state.aiClearAttachments()
 	// Persisted terminal IDs are not identities across application restarts.

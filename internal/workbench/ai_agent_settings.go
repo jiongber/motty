@@ -8,9 +8,12 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/vivaui/viva/app"
 	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/ui"
 	"motty/internal/ai/gate"
@@ -23,9 +26,22 @@ import (
 // client configuration that starts it, and what they did.
 
 var (
-	hitAISetAgentCopy  = tree.ID(aiSettingsHits, "ai-set-agent-copy")
-	hitAISetAgentClear = tree.ID(aiSettingsHits, "ai-set-agent-clear")
+	hitAISetAgentCopy      = tree.ID(aiSettingsHits, "ai-set-agent-copy")
+	hitAISetAgentClear     = tree.ID(aiSettingsHits, "ai-set-agent-clear")
+	hitAISetAgentHostsView = tree.ID(aiSettingsHits, "ai-set-agent-hosts-view")
+
+	hitAISetAgentTransferAdd    = tree.ID(aiSettingsHits, "ai-set-agent-transfer-add")
+	hitAISetAgentTransferRemove = func() (ids [maxAgentTransferRoots]gfx.ID) {
+		for i := range ids {
+			ids[i] = tree.ID(aiSettingsHits, "ai-set-agent-transfer-remove-"+strconv.Itoa(i))
+		}
+		return
+	}()
 )
+
+// maxAgentTransferRoots bounds the folder list so every row has a fixed control
+// identity.
+const maxAgentTransferRoots = 8
 
 // agentAuditShown is how many of the latest calls the page lists.
 const agentAuditShown = 5
@@ -63,10 +79,55 @@ func (state *State) aiAgentClick(id gfx.ID) bool {
 		if db, err := state.aiStore(); err == nil && db.ClearAudit() == nil {
 			state.aiWrote()
 		}
+	case hitAISetAgentHostsView:
+		state.openAgentHostsView()
+	case hitAISetAgentTransferAdd:
+		state.addAgentTransferRoot()
 	default:
+		for index, remove := range hitAISetAgentTransferRemove {
+			if id == remove {
+				state.removeAgentTransferRoot(index)
+				return true
+			}
+		}
 		return false
 	}
 	return true
+}
+
+// addAgentTransferRoot lets the user pick a local folder agents may transfer
+// files within. A canceled picker changes nothing.
+func (state *State) addAgentTransferRoot() {
+	roots := state.ai.agentTransferRoots
+	if len(roots) >= maxAgentTransferRoots {
+		return
+	}
+	directory, err := state.options.OpenDirectory(app.OpenDirectoryOptions{Title: state.messages.AISettings.AgentTransferChoose})
+	if err != nil || directory == "" {
+		return
+	}
+	directory = filepath.Clean(directory)
+	if slices.Contains(roots, directory) {
+		return
+	}
+	state.putAgentTransferRoots(append(slices.Clone(roots), directory))
+}
+
+func (state *State) removeAgentTransferRoot(index int) {
+	roots := state.ai.agentTransferRoots
+	if index < 0 || index >= len(roots) {
+		return
+	}
+	state.putAgentTransferRoots(slices.Delete(slices.Clone(roots), index, index+1))
+}
+
+func (state *State) putAgentTransferRoots(roots []string) {
+	value := ""
+	if len(roots) > 0 {
+		encoded, _ := json.Marshal(roots)
+		value = string(encoded)
+	}
+	state.aiPut(agentTransferRootsSetting, value)
 }
 
 // applyAIAgentMode stores the stdio server's access level the choice already
@@ -97,29 +158,9 @@ func (state *State) agentExecutable() string {
 }
 
 // agentHostLabels are the names of the hosts open to agents, in catalog order.
+// The labels are cached separately so a large catalog never becomes one giant
+// wrapping text run.
 func (state *State) agentHostLabels() []string {
-	var labels []string
-	for _, host := range state.agentHostList() {
-		labels = append(labels, host.Label)
-	}
-	return labels
-}
-
-// agentSummary caches the texts the page shows about agents, which are made of
-// data that changes rarely, so that painting an unchanged page allocates nothing.
-type agentSummary struct {
-	hostsHash  uint64
-	hostsCount int
-	hostsText  string
-
-	lines    []string
-	language i18n.Language
-}
-
-// agentHostsText lists the hosts open to agents, or says there are none. It is
-// rebuilt only when the hosts that are open, or their names, are not the ones it
-// was made from.
-func (state *State) agentHostsText() string {
 	const offset, prime = 14695981039346656037, 1099511628211
 	hash, count := uint64(offset), 0
 	for index := range state.hosts {
@@ -133,15 +174,29 @@ func (state *State) agentHostsText() string {
 		}
 		hash = (hash ^ 0xff) * prime
 	}
-	if count == 0 {
-		return state.messages.AISettings.AgentHostsNoneDesc
-	}
 	cache := &state.ai.agentSummary
-	if cache.hostsCount != count || cache.hostsHash != hash || cache.hostsText == "" {
+	if cache.hostsCount != count || cache.hostsHash != hash {
 		cache.hostsHash, cache.hostsCount = hash, count
-		cache.hostsText = strings.Join(state.agentHostLabels(), ", ")
+		cache.hosts = make([]string, 0, count)
+		for index := range state.hosts {
+			host := &state.hosts[index]
+			if host.isSSH() && state.agentHosts[host.CatalogID] {
+				cache.hosts = append(cache.hosts, host.Label)
+			}
+		}
 	}
-	return cache.hostsText
+	return cache.hosts
+}
+
+// agentSummary caches the texts the page shows about agents, which are made of
+// data that changes rarely, so that painting an unchanged page allocates nothing.
+type agentSummary struct {
+	hostsHash  uint64
+	hostsCount int
+	hosts      []string
+
+	lines    []string
+	language i18n.Language
 }
 
 // agentAuditLines are the latest calls as the page shows them, in the language
@@ -164,7 +219,6 @@ func (state *State) agentAuditLines() []string {
 
 func (state *State) paintAIAgents(page *settingsPage) {
 	c, pal, m := page.c, state.pal, state.messages.AISettings
-	hosts := state.agentHostsText()
 	entries := state.ai.agentAudit
 	activity := m.AgentActivityNone
 	if len(entries) > 0 {
@@ -180,24 +234,11 @@ func (state *State) paintAIAgents(page *settingsPage) {
 		if state.ai.settings.agentMode == gate.ModeAllowAll {
 			page.mcpAccessWarning(m.AgentAllowAllWarning)
 		}
-		hostMode := state.effectiveAgentHostMode()
 		choices := agentHostModeChoices[:]
 		controlWidth := max(min(float32(300), max(float32(190), page.width*0.40)), settingsChoiceWidth(page, choices, state.agentHostModeLabel))
 		controlWidth = min(controlWidth, max(page.width-60, 0))
-		page.mcpFrame(m.AgentHosts, hosts, pal.muted, func() {
-			choice := ui.Choice(c, &hostMode, choices, state.agentHostModeLabel).Width(controlWidth)
-			if choice.Changed() {
-				state.applyAgentHostMode(hostMode)
-				return
-			}
-			// Clicking the option already shown changes nothing in the value, but
-			// is still a choice: re-apply the effective mode, so a stored label
-			// that drifted from the permissions is written back as what the page
-			// shows.
-			if _, clicked := choice.ChosenIndex(); clicked {
-				state.applyAgentHostMode(state.effectiveAgentHostMode())
-			}
-		})
+		page.mcpAgentHostsFrame(controlWidth)
+		state.paintAgentTransferRoots(page)
 		page.separator()
 		state.paintMCPConfigBlock(page, aiMCPConfigView{
 			title: m.AgentConfig, description: m.AgentConfigDesc,
@@ -341,3 +382,25 @@ func shellWord(word string) string {
 
 // executableOf is Options.Executable's default.
 func executableOf() (string, error) { return os.Executable() }
+
+// paintAgentTransferRoots is the list of local folders agents may transfer files
+// within. The rows are offered under any access level so the setting can be
+// found, but the service uses them only under full access.
+func (state *State) paintAgentTransferRoots(page *settingsPage) {
+	c, pal, m := page.c, state.pal, state.messages.AISettings
+	roots := state.ai.agentTransferRoots
+	description := m.AgentTransferDesc
+	if len(roots) == 0 {
+		description = m.AgentTransferNoneDesc
+	}
+	page.mcpFrame(m.AgentTransfer, description, pal.muted, func() {
+		page.button(hitAISetAgentTransferAdd, m.AgentTransferAdd, aiButtonOutline, len(roots) >= maxAgentTransferRoots)
+	})
+	for index, root := range roots[:min(len(roots), maxAgentTransferRoots)] {
+		page.separator()
+		ui.Row(c).FillWidth().PadSides(8, 18, 8, 18).Gap(12).Items(ui.Center).Children(func() {
+			ui.Wrap(c, root).FontSize(metrics.FontSizeS).LineHeight(16).Color(pal.text).Grow(1)
+			page.button(hitAISetAgentTransferRemove[index], m.AgentTransferRemove, aiButtonOutline, false).Shrink(0)
+		})
+	}
+}

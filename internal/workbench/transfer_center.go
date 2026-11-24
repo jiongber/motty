@@ -227,6 +227,11 @@ type revealResult struct {
 // its outcome for pumpRevealResults. One reveal is in flight at a time: a second
 // request while one runs is dropped.
 func (state *State) revealLocalPath(path, title, failed, missing string) {
+	state.launchFileManager(path, title, failed, missing, state.options.RevealPath)
+}
+
+// launchFileManager 在后台启动文件管理器，并复用统一的结果提示。
+func (state *State) launchFileManager(path, title, failed, missing string, reveal func(string) error) {
 	if state.revealBusy {
 		return
 	}
@@ -234,7 +239,6 @@ func (state *State) revealLocalPath(path, title, failed, missing string) {
 	if state.revealResults == nil {
 		state.revealResults = make(chan revealResult, 1)
 	}
-	reveal := state.options.RevealPath
 	go func() {
 		var err error
 		if reveal == nil {
@@ -497,7 +501,7 @@ func (state *State) describeTransfer(entry *transferEntry) {
 	if snapshot.Recursive {
 		mode = fs.ModeDir
 	}
-	entry.fileIcon, entry.monoIcon = sftpFileIcon(entry.title, mode)
+	entry.fileIcon, entry.monoIcon = sftpFileIcon(sftpclient.Entry{Name: entry.title, Mode: mode})
 	entry.typeIcon = state.attachTypeIcon(entry.title, mode.IsDir())
 	entry.searchTitle = strings.ToLower(entry.title)
 	entry.status = m.Queued
@@ -547,7 +551,11 @@ func (state *State) describeTransfer(entry *transferEntry) {
 	}
 	entry.elapsed = "—"
 	if !started.IsZero() {
-		entry.elapsed = max(ended.Sub(started), 0).Round(time.Second).String()
+		elapsed := max(ended.Sub(started), 0)
+		if elapsed >= time.Millisecond {
+			elapsed = elapsed.Round(time.Millisecond)
+		}
+		entry.elapsed = elapsed.String()
 	}
 	entry.outcome = entry.status
 	switch {

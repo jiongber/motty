@@ -40,9 +40,11 @@ type commandPaletteEntry struct {
 	header bool
 	// foldKey makes a header a row that folds its group: a choice of its own,
 	// which opens or closes the rows under it. foldKey names the group and
-	// expanded says which way it is now. Headers without one only label.
+	// expanded says which way it is now. depth indents nested groups and their
+	// rows in the unfiltered tree. Headers without foldKey only label.
 	foldKey  string
 	expanded bool
+	depth    uint8
 	// checkable rows are choices that tick on and off without closing the
 	// palette: the terminals a command is sent to.
 	checkable bool
@@ -177,6 +179,11 @@ func (state *State) rebuildCommandPalette() {
 		palette.add(messages.PaneSplitHorizontal, hitPaneSplitHorizontal)
 		palette.add(messages.PaneSplitVertical, hitPaneSplitVertical)
 		palette.add(messages.PaneClose, hitPaneClose)
+		// Maximizing needs a split: with one pane the command would silently do
+		// nothing, so the palette does not offer it.
+		if layout, ok := state.deck.Layout(state.deck.ActiveWorkspace()); ok && layout.Len() > 1 {
+			palette.add(messages.PaneMaximizeToggle, hitPaneMaximize)
+		}
 		palette.add(messages.MenuRenameTerminal, hitPaneRename)
 		palette.add(messages.SFTPOpen, hitSFTPOpen)
 		if session, _ := state.sessionByIDPointer(state.activeSessionID); session != nil {

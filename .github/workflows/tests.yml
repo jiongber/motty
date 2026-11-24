@@ -17,7 +17,7 @@ permissions:
 # reverse) without any change on the Motty side. Move the pin in the same commit
 # that needs a newer Viva API; do not check out the default branch here.
 env:
-  VIVA_REF: d812524c40f10c6a84de629c06234e4d0a16235a
+  VIVA_REF: 8b9d0bd6c81acdeab4759de8f95cbd616d359fd5
 
 # A superseded pull-request run is cancelled: the newer push contains everything
 # the older one would have tested, and leaving the older run in place makes the
@@ -157,6 +157,10 @@ jobs:
           # The workbench package is sharded below: run every other package
           # here, one parallel build of the whole set.
           go test $(go list ./... | grep -v '/internal/workbench$') -count=1 -timeout 20m
+      # The patched x/crypto is a module of its own, so ./... above skips it.
+      - name: Test the patched x/crypto
+        working-directory: motty/third_party/golang.org/x/crypto
+        run: go test ./ssh -count=1
 
   # The workbench package is one package that runs one test at a time, and the
   # suite outgrew the ten-minute per-binary default (and then twenty). It is
@@ -185,6 +189,10 @@ jobs:
         with:
           go-version-file: motty/go.mod
           cache-dependency-path: motty/go.sum
+      - name: Test Logo color picker and persistence
+        if: matrix.shard == 0
+        working-directory: motty
+        run: go test ./internal/workbench -run '^Test(IconColor|ChinaRed|LogoColor)' -count=1 -timeout 3m
       - name: Test the workbench
         working-directory: motty
         env:
@@ -303,6 +311,14 @@ jobs:
           restore-keys: |
             go-build-win-${{ hashFiles('motty/go.sum') }}-
             go-build-win-
+      - name: Test Logo color picker and persistence
+        if: matrix.shard == 0
+        working-directory: motty
+        run: go test ./internal/workbench -run '^Test(IconColor|ChinaRed|LogoColor)' -count=1 -timeout 3m
+      - name: Test Windows desktop icon resources and owned shortcuts
+        if: matrix.shard == 0
+        working-directory: motty
+        run: go test ./cmd/motty -run '^TestDesktop' -count=1 -timeout 2m
       - name: Test remote tools platform handling
         if: matrix.shard == 0
         working-directory: motty

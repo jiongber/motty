@@ -11,6 +11,7 @@ import (
 	"github.com/vivaui/viva/keymap"
 	"github.com/vivaui/viva/text"
 	"github.com/vivaui/viva/ui"
+	"motty/internal/configstore"
 	"motty/internal/term"
 )
 
@@ -25,6 +26,11 @@ type snippet struct {
 	Group string
 	// Run presses Enter after sending, so the command runs at once.
 	Run bool
+	// Lines sends a multi-line command one line at a time, each line submitted
+	// with Enter before the next goes out, as the paste review's line-by-line
+	// choice does; Run then decides only the last line. Without it the lines go
+	// as one paste.
+	Lines bool
 	// Shortcut sends the snippet from the terminal; the zero chord is none. It is
 	// kept on this device only: the modifier that is free differs by platform.
 	Shortcut keymap.Chord
@@ -38,9 +44,13 @@ const (
 	// working set: users migrating from other tools arrive with hundreds of
 	// commands (#211), and a list of this size costs the page's table and
 	// the command palette nothing noticeable.
-	maxSnippets       = 512
-	maxSnippetName    = 80
-	maxSnippetCommand = 4096
+	maxSnippets    = 512
+	maxSnippetName = 80
+	// maxSnippetCommand bounds one command. A snippet is one configstore record,
+	// and the store refuses a payload over its MaxPayload; the editor accepts up
+	// to this and submitSnippet refuses a command whose record would not fit
+	// instead of cutting it. A long script or README must round-trip whole.
+	maxSnippetCommand = configstore.MaxPayload
 )
 
 // snippetsHits is the place of the controls this file paints.
@@ -54,6 +64,7 @@ var (
 	hitSnippetName        = tree.ID(snippetsHits, "snippet-name")
 	hitSnippetCommand     = tree.ID(snippetsHits, "snippet-command")
 	hitSnippetRun         = tree.ID(snippetsHits, "snippet-run")
+	hitSnippetLines       = tree.ID(snippetsHits, "snippet-lines")
 	hitSnippetShortcut    = tree.ID(snippetsHits, "snippet-shortcut")
 	hitSnippetShortcutOff = tree.ID(snippetsHits, "snippet-shortcut-clear")
 	hitSnippetSubmit      = tree.ID(snippetsHits, "snippet-submit")
@@ -81,9 +92,11 @@ var (
 type snippetsUI struct {
 	list []snippet
 
-	// The page's group filter: the groups there are, the list indices it shows
-	// in the order it shows them, and the integer choices its Select is over.
+	// The page's group filter: the groups there are, how many snippets each
+	// names, the list indices it shows in the order it shows them, and the
+	// integer choices its Select is over.
 	groups        []string
+	groupCounts   map[string]int
 	hasUngrouped  bool
 	visible       []int
 	filter        snippetFilter
@@ -96,6 +109,7 @@ type snippetsUI struct {
 	command     text.Editor
 	commandArea dialogArea
 	run         bool
+	lines       bool
 	groupPicker components.SingleSelectState
 	shortcut    keymap.Chord
 	capturing   bool // the next chord pressed becomes shortcut
@@ -210,19 +224,27 @@ func cleanSnippetText(value string, limit int) string {
 	return strings.TrimSpace(cleanSnippetLine(value, limit))
 }
 
-// cleanSnippetCommand is cleanSnippetText for a command, which keeps its
+// sanitizeSnippetCommand makes what was typed safe to send: CRLF and lone CR
+// become the newline the editor shows, and a control character is dropped
+// because sending it would be a key the user never meant. It keeps the
 // surrounding space: "cd " or "ssh " is sent to be finished by hand, and a
-// leading space keeps a command out of the shell's history. A command of nothing
-// but space is empty.
-func cleanSnippetCommand(value string, limit int) string {
+// leading space keeps a command out of the shell's history.
+func sanitizeSnippetCommand(value string) string {
 	value = strings.ReplaceAll(strings.ReplaceAll(value, "\r\n", "\n"), "\r", "\n")
-	value = strings.Map(func(character rune) rune {
+	return strings.Map(func(character rune) rune {
 		if character < 0x20 && character != '\n' || character == 0x7f {
 			return -1
 		}
 		return character
 	}, value)
-	if len(value) > limit {
+}
+
+// cleanSnippetCommand is sanitizeSnippetCommand with a damaged or old state
+// file's oversized command bounded to limit, so one bad record cannot make the
+// editor or the next save carry an arbitrarily large string.
+func cleanSnippetCommand(value string, limit int) string {
+	value = sanitizeSnippetCommand(value)
+	if limit > 0 && len(value) > limit {
 		value = strings.ToValidUTF8(value[:limit], "")
 	}
 	if strings.TrimSpace(value) == "" {
@@ -294,7 +316,7 @@ func (state *State) openSnippetDialog(index int) {
 	form.editing = index
 	form.name, form.command = text.Editor{}, text.Editor{}
 	form.commandArea = dialogArea{}
-	form.run = true
+	form.run, form.lines = true, false
 	group := ""
 	form.shortcut, form.capturing = keymap.Chord{}, false
 	form.dialogError = ""
@@ -302,6 +324,7 @@ func (state *State) openSnippetDialog(index int) {
 		form.name.Insert(form.list[index].Name)
 		form.command.Insert(form.list[index].Command)
 		form.run = form.list[index].Run
+		form.lines = form.list[index].Lines
 		form.shortcut = form.list[index].Shortcut
 		group = form.list[index].Group
 	}
@@ -322,12 +345,17 @@ func (state *State) clickSnippetDialog(id gfx.ID) {
 	case hitSnippetRun:
 		form.run = !form.run
 		form.groupPicker.Open = false
+	case hitSnippetLines:
+		form.lines = !form.lines
+		form.groupPicker.Open = false
 	case hitSnippetShortcut:
 		form.capturing = !form.capturing
 		form.dialogError = ""
 	case hitSnippetShortcutOff:
 		form.shortcut, form.capturing = keymap.Chord{}, false
 		form.dialogError = ""
+	case hitSnippetDialogGroups:
+		state.openSnippetGroupsManagerFor(true)
 	}
 }
 
@@ -394,6 +422,15 @@ func (form *snippetsUI) abandonOther(target gfx.ID) {
 	}
 }
 
+// snippetOrder is the place the edited snippet occupies, or the place a new one
+// would take. It is part of the record the save measures.
+func (form *snippetsUI) snippetOrder() int {
+	if form.editing >= 0 && form.editing < len(form.list) {
+		return form.editing
+	}
+	return len(form.list)
+}
+
 func (state *State) submitSnippet() {
 	form, m := &state.snippets, state.messages.Tools
 	if form.composing() || !state.commitSnippetGroupQuery() {
@@ -402,16 +439,20 @@ func (state *State) submitSnippet() {
 	entry := snippet{
 		Group:    cleanSnippetGroup(form.groupPicker.Value()),
 		Name:     cleanSnippetText(form.name.String(), maxSnippetName),
-		Command:  cleanSnippetCommand(form.command.String(), maxSnippetCommand),
+		Command:  sanitizeSnippetCommand(form.command.String()),
 		Run:      form.run,
+		Lines:    form.lines,
 		Shortcut: form.shortcut,
 	}
 	switch {
 	case entry.Name == "":
 		form.dialogError = m.SnippetErrorName
 		return
-	case entry.Command == "":
+	case strings.TrimSpace(entry.Command) == "":
 		form.dialogError = m.SnippetErrorCommand
+		return
+	case len(entry.Command) > maxSnippetCommand || !snippetRecordFits(entry, form.snippetOrder()):
+		form.dialogError = m.SnippetErrorTooLong
 		return
 	}
 	if form.editing >= 0 && form.editing < len(form.list) {
@@ -552,6 +593,14 @@ func (state *State) sendSnippet(index int) bool {
 // while the tab is broadcasting.
 func (state *State) sendResolvedSnippet(entry snippet, command string, session *Session) bool {
 	m := state.messages.Tools
+	if entry.Lines && strings.Contains(command, "\n") {
+		if !state.startPasteQueue(session, splitPasteLines(command), entry.Run) {
+			state.showActionWarning(m.SnippetsTitle, m.StatusSnippetNotConnected)
+			return false
+		}
+		state.status = fmt.Sprintf(m.StatusSnippetSentFmt, entry.Name, session.Title)
+		return true
+	}
 	input := term.EncodePaste(command, session.term.screen.Modes().BracketedPaste && strings.Contains(command, "\n"))
 	if entry.Run {
 		input = append(input, '\r')
@@ -619,6 +668,10 @@ func (state *State) sendSnippetPicked(index int, session *Session) {
 	if state.sendResolvedSnippet(entry, entry.Command, session) {
 		state.ActivatePane(session.ID)
 		state.activeSection = sectionTerminal
+		// The page had the keyboard, and the page is what the click was on. The
+		// terminal is now on screen, so ask the next paint for its keyboard;
+		// otherwise the command arrives but typing goes nowhere until a click.
+		state.returnKeyboardToTerminal()
 	}
 }
 
@@ -669,7 +722,8 @@ func (state *State) declareSnippetDialog(c ui.C) {
 		title = m.SnippetDialogEditTitle
 	}
 	viewport := dialogViewport(c)
-	height := dialogContentHeight(c.Canvas(), *c.Theme(), viewport, 560, "", withError(350, form.dialogError))
+	// The name row, then the command box and the rows under it.
+	height := dialogContentHeight(c.Canvas(), *c.Theme(), viewport, 560, "", withError(282+dialogRowHeight(c.Theme())+dialogCheckGapAbove+dialogCheckHeight, form.dialogError))
 	// No scrim dismiss: a press beside the form must not discard its input.
 	dialog := ui.Dialog(c, ui.DialogSpec{
 		Title: title, Width: 560, Height: height, Layer: dialogLayer,
@@ -697,14 +751,24 @@ func (state *State) declareSnippetDialogBody(c ui.C) {
 			form.nameBound = true
 		}
 		form.nameText.Invalid = form.dialogError != ""
-		ui.FormField(c, &form.nameForm, m.SnippetName).FillWidth().Height(62).MarginSides(0, 0, 6, 0).Children(func() {
+		ui.FormField(c, &form.nameForm, m.SnippetName).FillWidth().Height(dialogRowHeight(c.Theme())).Children(func() {
 			ui.TextFieldID(c, hitSnippetName, &form.nameText, m.SnippetName, m.SnippetNamePlaceholder)
 		})
 		ui.Column(c).Height(140).MarginSides(0, 0, 6, 0).Children(func() {
 			form.commandArea.declare(c, hitSnippetCommand, &form.command, m.SnippetCommand, m.SnippetCommandPlaceholder, 140)
 		})
-		form.dialogGroup = ui.Slot(c).Height(62).MarginSides(0, 0, 6, 0)
+		if len(form.groups) > 0 {
+			ui.Row(c).Height(62).MarginSides(0, 0, 6, 0).Gap(8).Items(ui.Center).Children(func() {
+				form.dialogGroup = ui.Slot(c).Grow(1).Height(62)
+				groupsWidth := toolbarButtonWidth(c.Canvas(), m.SnippetGroupsManage, false)
+				dialogButton(c, m.SnippetGroupsManage, components.ButtonGhost, false).
+					Hit(hitSnippetDialogGroups, m.SnippetGroupsManage).Width(groupsWidth).Height(32)
+			})
+		} else {
+			form.dialogGroup = ui.Slot(c).Height(62).MarginSides(0, 0, 6, 0)
+		}
 		state.declareDialogCheck(c, hitSnippetRun, m.SnippetRun, form.run, 7, 0)
+		state.declareDialogCheck(c, hitSnippetLines, m.SnippetLines, form.lines, dialogCheckGapAbove, 0)
 		ui.Row(c).Height(32).Items(ui.Center).MarginSides(12, 0, 0, 2).Children(func() {
 			ui.Text(c, m.SnippetShortcut).FontSize(metrics.FontSizeM).Weight(gfx.WeightMedium).Color(state.pal.text).LineHeight(20).Grow(1)
 			label := m.SnippetShortcutNone

@@ -9,6 +9,7 @@ import (
 	"github.com/vivaui/viva/app"
 	"github.com/vivaui/viva/components"
 	"github.com/vivaui/viva/gfx"
+	"github.com/vivaui/viva/keymap"
 	"github.com/vivaui/viva/ui"
 )
 
@@ -75,7 +76,10 @@ func (state *State) openRemoteToolsWindowTab(session *Session, tab remoteTab, sw
 	w.ui.language, w.ui.messages = state.language, state.messages
 	w.ui.appearance, w.ui.pal, w.ui.theme = state.appearance, state.pal, state.theme
 	w.ui.modal, w.ui.activeSessionID, w.ui.remoteWindow = modalRemoteTools, session.ID, w
-	w.ui.remote = remoteToolsView{session: session.ID, title: session.Title, tab: tab, sort: state.remote.sort, serial: 1}
+	w.ui.remote = remoteToolsView{
+		session: session.ID, title: session.Title, tab: tab, sort: state.remote.sort, serial: 1,
+		columnWidths: &w.owner.remoteColumnWidths,
+	}
 	window, err := state.options.OpenContentWindow(w.config(), nil)
 	if err != nil {
 		w.dispose()
@@ -134,6 +138,9 @@ func (w *remoteToolsWindow) bind(owner *State, source *Session) {
 	w.session.Title, w.session.Address, w.session.host = source.Title, source.Address, source.host
 	w.session.conn, w.session.term, w.session.phase = w.connection, source.term, source.phase
 	w.session.sudoCommands, w.session.sudoPassword = source.sudoCommands, source.sudoPassword
+	// The widths belong to the workbench presenting the session, so a window
+	// that moves to another workbench follows that workbench's sizes.
+	w.ui.remote.columnWidths = &owner.remoteColumnWidths
 }
 
 // Locate the captured connection, including after its tab moves to another
@@ -180,6 +187,7 @@ func (w *remoteToolsWindow) dispose() {
 	w.ui.cancelRemoteProcessCommand()
 	w.ui.cancelRemoteProcessEnvironment()
 	w.ui.cancelRemoteContainerEnvironment()
+	w.ui.cancelRemoteContainerInspect()
 	w.cancel()
 	w.session.sudoCommands, w.session.sudoPassword = false, ""
 	w.owner.remoteWindows = slices.DeleteFunc(w.owner.remoteWindows, func(other *remoteToolsWindow) bool { return other == w })
@@ -377,8 +385,8 @@ func (w *remoteToolsWindow) key(event gfx.KeyEvent) gfx.EventResult {
 	return gfx.EventResult{}
 }
 
-// shortcut gives the tools' own find key and the detail text's copy/select-all
-// their chords.
+// shortcut handles closing the tools window, finding, and copying or selecting
+// the detail text.
 func (w *remoteToolsWindow) shortcut(event gfx.KeyEvent) gfx.EventResult {
 	if w.closed {
 		return gfx.EventResult{Handled: true}
@@ -386,6 +394,13 @@ func (w *remoteToolsWindow) shortcut(event gfx.KeyEvent) gfx.EventResult {
 	w.ui.shortcuts = w.owner.shortcuts
 	if w.ui.modal == modalForm || w.ui.modal == modalSudoSFTP || w.ui.remote.auto.open {
 		return gfx.EventResult{}
+	}
+	if chord, ok := keymap.FromEvent(event); ok && w.ui.shortcuts.actionFor(chord) == shortcutCloseTab {
+		// Close this tools window, not the source workbench's SSH tab.
+		if !event.Release && !event.Repeat {
+			w.close()
+		}
+		return gfx.EventResult{Handled: true}
 	}
 	if result, handled := w.ui.remoteDetailShortcut(event); handled {
 		return result

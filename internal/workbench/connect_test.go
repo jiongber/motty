@@ -56,6 +56,9 @@ func TestConnectIsDisabledUntilTheSearchBoxHoldsSomething(t *testing.T) {
 func TestConnectOpensWhatTheSearchBoxHolds(t *testing.T) {
 	world, options := newWorld(t)
 	state := newTestState(t, options)
+	// This test walks the reuse path: the second Connect must land in the tab
+	// the first one opened. Reuse is off by default, so ask for it here.
+	state.startupReuse = true
 
 	// A target nobody saved: user, host and port are read from the text.
 	typeSearch(state, "ops@10.0.0.9:2201")
@@ -376,6 +379,48 @@ func TestEscapeEmptiesTheSearchBox(t *testing.T) {
 	}
 }
 
+func TestSearchClearButtonEmptiesTheSearchBox(t *testing.T) {
+	state := newTestState(t, testOptions(t))
+	clear := func() (gfx.Hit, bool) {
+		canvas, _ := paintedTexts(state)
+		return hitByLabelAny(canvas, state.messages.SearchClear)
+	}
+	if _, ok := clear(); ok {
+		t.Fatal("search clear button is visible while the search box is empty")
+	}
+
+	typeSearch(state, "stag")
+	if len(state.visible) != 1 {
+		t.Fatalf("search did not filter: got %d visible, want 1", len(state.visible))
+	}
+	button, ok := clear()
+	if !ok {
+		t.Fatal("search clear button is missing while search box has text")
+	}
+
+	clickInEventPass(t, state, gfx.Size{Width: 1400, Height: 900}, button.ID)
+	if state.search.String() != "" {
+		t.Fatalf("clicking clear button did not empty text: %q", state.search.String())
+	}
+	if len(state.visible) != len(state.hosts) {
+		t.Fatalf("clearing search left %d of %d hosts visible", len(state.visible), len(state.hosts))
+	}
+
+	if _, ok := clear(); ok {
+		t.Fatal("search clear button is still visible after being cleared")
+	}
+}
+
+// clickInEventPass delivers a press on id in the event pass of a paint, where
+// the page's in-place action reads see it, as the runtime does.
+func clickInEventPass(t testing.TB, state *State, size gfx.Size, id gfx.ID) {
+	t.Helper()
+	var canvas gfx.Canvas
+	canvas.BeginEventPass(id, gfx.ClickInfo{})
+	state.Paint(&canvas, size)
+	canvas.EndEventPass()
+}
+
 func TestOnlyTheHostsPageHasASearchEditor(t *testing.T) {
 	world, options := newWorld(t)
 	state := newTestState(t, options)
@@ -447,6 +492,7 @@ func TestSearchBoxKeepsSteadyStatePaintAllocationFree(t *testing.T) {
 func TestConnectingAndFailingStillWorksFromATypedTarget(t *testing.T) {
 	world, options := newWorld(t)
 	state := newTestState(t, options)
+	state.startupReuse = true
 	typeSearch(state, "solo.example.com")
 	state.Click(hitConnect)
 	fake := world.conns[0]
@@ -466,6 +512,7 @@ func TestConnectingAndFailingStillWorksFromATypedTarget(t *testing.T) {
 func TestTypingASavedHostInFullOpensThatHostNotADuplicate(t *testing.T) {
 	world, options := newWorld(t)
 	state := newTestState(t, options)
+	state.startupReuse = true
 	openHost(state) // Production, deploy@prod.example.com:22
 	state.Click(hitHosts)
 

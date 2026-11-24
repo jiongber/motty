@@ -126,6 +126,10 @@ func (state *State) declareCommandPaletteBody(c ui.C) {
 			// control of the dialog, never a result of the search below it.
 			state.declareCommandPaletteBarToggle(c)
 			ui.Spacer(c).Height(6).Shrink(0)
+			if state.commands.shown {
+				state.declareCommandPalettePlacement(c)
+				ui.Spacer(c).Height(6).Shrink(0)
+			}
 		}
 		ui.TextFieldID(c, hitCommandPaletteSearch, &palette.searchField, palette.searchLabel, palette.searchPlace).
 			Height(36).FillWidth().Shrink(0).NavigationKeys()
@@ -230,6 +234,24 @@ func (state *State) declareCommandPaletteBarToggle(c ui.C) {
 	})
 }
 
+// declareCommandPalettePlacement paints the dock control under the bar's
+// checkbox: the bottom strip or the sidebar beside the panes. It appears only
+// while the bar is shown, so a hidden bar keeps the dialog's height for the
+// list; the saved dock is there again when the bar comes back.
+func (state *State) declareCommandPalettePlacement(c ui.C) {
+	pal := state.pal
+	previous := state.commands.placement
+	ui.Row(c).Height(26).FillWidth().PadX(8).Gap(8).Items(ui.Center).Shrink(0).Children(func() {
+		ui.Text(c, state.messages.Tools.CommandsPlacement).FontSize(metrics.FontSizeS).Color(pal.muted).Shrink(0)
+		ui.Spacer(c).Grow(1)
+		choice := ui.Choice(c, &state.commands.placement, commandsPlacementChoices[:], state.commandsPlacementLabel).
+			Width(140).Height(26).Shrink(0)
+		if choice.Changed() {
+			c.After(func() { state.commandsPlacementChanged(previous) })
+		}
+	})
+}
+
 // declareCommandPaletteRow declares one choice of the list.
 func (state *State) declareCommandPaletteRow(c ui.C, entry commandPaletteEntry, visible int) {
 	palette := &state.commandPalette
@@ -256,7 +278,11 @@ func (state *State) declareCommandPaletteRow(c ui.C, entry commandPaletteEntry, 
 	if selected {
 		color, detailColor = state.pal.onAccent, state.pal.onAccent
 	}
-	row := ui.Row(c).Height(30).PadX(10).Gap(12).Items(ui.Center).Shrink(0)
+	padLeft := float32(10)
+	if palette.query == "" && entry.depth > 0 {
+		padLeft += float32(min(int(entry.depth), 8)) * 14
+	}
+	row := ui.Row(c).Height(30).PadSides(0, 10, 0, padLeft).Gap(12).Items(ui.Center).Shrink(0)
 	if selected {
 		row.Background(state.pal.accent).Radius(radius.item)
 	}
@@ -337,12 +363,16 @@ func (state *State) paintCommandPaletteChrome(d *ui.DrawContext) {
 
 // commandPaletteHeight is the dialog's height: the snippet picker adds the form
 // that sends a typed command under its list, and the command bar's checkbox
-// above its search field when that page has a bar to switch.
+// above its search field when that page has a bar to switch. A shown bar also
+// adds its dock control under the checkbox.
 func (state *State) commandPaletteHeight() float32 {
 	if state.commandPalette.snippets {
 		height := float32(474 + 12 + 36 + 8 + 32)
 		if state.commandBarSwitchShown() {
 			height += 26 + 6
+			if state.commands.shown {
+				height += 26 + 6
+			}
 		}
 		return height
 	}
@@ -354,7 +384,8 @@ func (state *State) commandPaletteHeight() float32 {
 func (state *State) declareFoldRow(c ui.C, entry commandPaletteEntry, visible int) {
 	selected := state.commandPalette.selected == visible
 	color, detailColor := state.pal.muted, state.pal.faint
-	row := ui.Row(c).Height(30).PadX(10).Gap(8).Items(ui.Center).Shrink(0)
+	padLeft := float32(10 + min(int(entry.depth), 8)*14)
+	row := ui.Row(c).Height(30).PadSides(0, 10, 0, padLeft).Gap(8).Items(ui.Center).Shrink(0)
 	if selected {
 		color, detailColor = state.pal.onAccent, state.pal.onAccent
 		row.Background(state.pal.accent).Radius(radius.item)

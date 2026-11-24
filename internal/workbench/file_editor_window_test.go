@@ -1,12 +1,157 @@
 package workbench
 
 import (
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/vivaui/viva/app"
 	"github.com/vivaui/viva/components"
 	"github.com/vivaui/viva/gfx"
+	"github.com/vivaui/viva/headless"
+	"motty/internal/sftpclient"
 )
+
+// A save in flight must look like work in progress, not like a finished save:
+// the footer names the state and animates a spinner beside it.
+func TestDocumentFooterAnimatesWhileSaving(t *testing.T) {
+	d := documentFixture(t)
+	d.busy = true
+	d.status = d.owner.messages.FileWindow.Saving
+	var saving gfx.Canvas
+	d.paint(&saving, gfx.Size{Width: 900, Height: 640})
+	status, animating := documentFooterState(&saving, d.owner.messages.FileWindow.Saving)
+	if !status {
+		t.Fatal("the saving footer does not name the save")
+	}
+	if !animating {
+		t.Fatal("the saving footer does not animate a spinner")
+	}
+
+	d.busy = false
+	d.status = d.owner.messages.FileWindow.Ready
+	var idle gfx.Canvas
+	d.paint(&idle, gfx.Size{Width: 900, Height: 640})
+	if status, animating := documentFooterState(&idle, d.owner.messages.FileWindow.Saving); status || animating {
+		t.Fatalf("an idle footer still shows progress: status=%v animating=%v", status, animating)
+	}
+}
+
+// documentFooterState reports whether the painted footer names the given state
+// and whether anything in it asks for the next frame, which only the spinner
+// does when nothing is focused.
+func documentFooterState(canvas *gfx.Canvas, status string) (named, animating bool) {
+	for _, text := range canvas.Texts() {
+		if strings.Contains(text.Value, status) {
+			named = true
+		}
+	}
+	_, animating = canvas.NextFrame()
+	return named, animating
+}
+
+// The comparison window is the other place a save starts; its footer shows the
+// same in-progress state.
+func TestComparisonFooterAnimatesWhileSaving(t *testing.T) {
+	d := documentFixture(t)
+	d.local = false
+	d.comparison.active = true
+	d.comparison.baseline = d.original
+	d.comparison.result = components.DiffCodeLines(d.original, d.editor.String())
+	d.busy = true
+	d.comparison.saving = true
+	var canvas gfx.Canvas
+	d.paintComparison(&canvas, gfx.Size{Width: 1120, Height: 720})
+	if status, animating := documentFooterState(&canvas, d.owner.messages.FileWindow.SavingChanges); !status || !animating {
+		t.Fatalf("the comparison save footer: status=%v animating=%v", status, animating)
+	}
+}
+
+// Confirming a remote save must immediately show unmistakable loading feedback:
+// the footer puts the saving status first so narrow windows cannot clip it,
+// and the save action switches to the saving label until the save settles.
+// A save that fails must leave the saving state: the label, the footer and the
+// spinner all follow it, and a stuck one would read as work still going on.
+func TestDocumentSavingEndsWhenTheSaveFails(t *testing.T) {
+	d := documentFixture(t)
+	d.busy, d.saveInFlight = true, true
+	d.status = d.owner.messages.FileWindow.Saving
+	if !d.saving() {
+		t.Fatal("a save in flight must read as saving")
+	}
+	d.apply(fileDocumentEvent{document: d, err: errors.New("disk full"), saved: true})
+	if d.saving() || d.busy {
+		t.Fatalf("after the save failed: saving=%v busy=%v", d.saving(), d.busy)
+	}
+}
+
+func TestDocumentSavingShowsVisibleLoadingState(t *testing.T) {
+	d := documentFixture(t)
+	d.cacheKey = "1:false:/test.log"
+	d.local = false
+	d.name = "test.log"
+	d.editor.Insert("edited\n")
+
+	m := &d.owner.fileWindows
+	m.documents = map[string]*fileDocument{d.cacheKey: d}
+	m.order = []string{d.cacheKey}
+	m.active = d.cacheKey
+
+	blockSave := make(chan struct{})
+	defer close(blockSave)
+	worker := sftpclient.NewWorker(func() (sftpclient.Remote, error) {
+		<-blockSave
+		return nil, sftpclient.ErrCanceled
+	}, func() {})
+	defer worker.Close()
+	d.worker = worker
+
+	view, err := headless.Open(m.config(), nil, headless.Options{Scale: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer view.Close()
+	if err := view.Rest(); err != nil {
+		t.Fatal(err)
+	}
+
+	findHit := func(id gfx.ID) gfx.Hit {
+		t.Helper()
+		for _, h := range view.Snapshot().Hits {
+			if h.ID == id {
+				return h
+			}
+		}
+		t.Fatalf("missing hit %v", id)
+		return gfx.Hit{}
+	}
+
+	saveHit := findHit(hitDocumentSave)
+	if err := view.Click(saveHit.Bounds.X+saveHit.Bounds.Width/2, saveHit.Bounds.Y+saveHit.Bounds.Height/2); err != nil {
+		t.Fatal(err)
+	}
+	if d.confirm != "save" {
+		t.Fatalf("clicking save opened confirm=%q, want save", d.confirm)
+	}
+
+	directHit := findHit(hitDocumentSaveDirect)
+	if err := view.Click(directHit.Bounds.X+directHit.Bounds.Width/2, directHit.Bounds.Y+directHit.Bounds.Height/2); err != nil {
+		t.Fatal(err)
+	}
+	if !d.busy || d.confirm != "" || !d.saving() {
+		t.Fatalf("after confirming save: busy=%v confirm=%q saving=%v", d.busy, d.confirm, d.saving())
+	}
+
+	savingText := d.owner.messages.FileWindow.Saving
+	if !strings.HasPrefix(d.footerStatus(), savingText) {
+		t.Fatalf("footerStatus() = %q, want prefix %q so narrow windows do not clip it", d.footerStatus(), savingText)
+	}
+
+	saveButton := findHit(hitDocumentSave)
+	if saveButton.Label != savingText {
+		t.Fatalf("save button label while saving = %q, want %q", saveButton.Label, savingText)
+	}
+}
 
 // A document and its comparison are windows of their own now, so each declares
 // the same titlebar the tools window does: the file it shows at the top, and

@@ -3,10 +3,13 @@ package workbench
 import (
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/vivaui/viva/gfx"
+	"github.com/vivaui/viva/text"
+	"github.com/vivaui/viva/ui"
 	"motty/internal/i18n"
 	"motty/internal/update"
 )
@@ -29,17 +32,111 @@ func normalizeTerminalFontSize(value float32) float32 {
 }
 
 // zoomTerminal changes the font size by delta points, or back to the default
-// when reset is set, and tells the user which size it is now.
+// when reset is set, and tells the user which size it is now. A keyboard step
+// saves at once; a wheel gesture defers its save and calls applyZoom instead.
 func (state *State) zoomTerminal(delta float32, reset bool) {
+	if state.applyZoom(delta, reset) {
+		state.save()
+	}
+}
+
+// applyZoom moves the terminal font size and writes the status line, reporting
+// whether the size actually changed. It saves nothing, so a primary+wheel burst
+// can coalesce its many steps into one write once the gesture settles.
+func (state *State) applyZoom(delta float32, reset bool) bool {
 	size := state.terminalFontSize + delta
 	if reset {
 		size = terminalFontSizeDefault
 	}
 	size = min(max(size, terminalFontSizeMin), terminalFontSizeMax)
-	if state.setTerminalFontSize(size) {
-		state.save()
-	}
+	changed := state.setTerminalFontSize(size)
 	state.status = fmt.Sprintf(state.messages.Tools.StatusFontSizeFmt, int(state.terminalFontSize))
+	return changed
+}
+
+// terminalZoomSaveDelay is how long the font size holds still after the last
+// wheel notch before it is written to disk, so a burst of wheeling saves once.
+const terminalZoomSaveDelay = 400 * time.Millisecond
+
+// scheduleTerminalZoomSave writes the wheel's font-size change once the gesture
+// settles. Each notch re-arms one timer, so a wheel saves on its last notch rather
+// than on every notch. The size is applied in memory at once, so the screen and
+// Close()'s own save already carry it if the window quits before this fires.
+func (state *State) scheduleTerminalZoomSave() {
+	if state.terminalZoomSaveTimer != nil {
+		state.terminalZoomSaveTimer.Stop()
+	}
+	state.terminalZoomSaveTimer = time.AfterFunc(terminalZoomSaveDelay, func() {
+		state.aiPost(func(state *State) {
+			state.terminalZoomSaveTimer = nil
+			if !state.closed {
+				state.save()
+			}
+		})
+	})
+}
+
+// stopTerminalZoomSave cancels a pending wheel save. The size is already applied
+// and Close() saves, so nothing is lost by stopping the timer here.
+func (state *State) stopTerminalZoomSave() {
+	if state.terminalZoomSaveTimer != nil {
+		state.terminalZoomSaveTimer.Stop()
+		state.terminalZoomSaveTimer = nil
+	}
+}
+
+// The preview size is how many megabytes of a file a document window loads at
+// once. It is chosen with a stepper and has no upper bound; only a value too
+// small to open anything is replaced by the default.
+const (
+	minFilePreviewMB     = 1
+	defaultFilePreviewMB = 20
+)
+
+// normalizeFilePreviewMB makes a saved size a usable one: a value below the
+// minimum is the default, so a damaged state file cannot refuse every file.
+func normalizeFilePreviewMB(value int) int {
+	if value < minFilePreviewMB {
+		return defaultFilePreviewMB
+	}
+	return value
+}
+
+// filePreviewBytes converts the setting to the byte bound a window enforces. A
+// value too large for an int is saturated instead of wrapping negative; the
+// stepper cannot produce one, only a damaged state file could.
+func filePreviewBytes(mb int) int {
+	mb = normalizeFilePreviewMB(mb)
+	if mb > int(^uint(0)>>1)>>20 {
+		return int(^uint(0) >> 1)
+	}
+	return mb << 20
+}
+
+// previewLimitMessage says a file is larger than the window's bound.
+func previewLimitMessage(messages i18n.Messages, mb int) string {
+	return fmt.Sprintf(messages.FileWindow.TooLargeFmt, strconv.Itoa(normalizeFilePreviewMB(mb))+" MB")
+}
+
+// filePreviewEdit is the stepper's field editor: the number is typed here while
+// it has the keyboard, and the stored setting follows when the edit commits.
+type filePreviewEdit struct {
+	input   text.Editor
+	field   ui.Field
+	editing bool
+	bound   bool
+}
+
+// previewDigit accepts the characters the field may hold.
+func previewDigit(r rune) bool { return r >= '0' && r <= '9' }
+
+// newFilePreviewInput is the field's editor, holding value with the digits and
+// length the field accepts.
+func newFilePreviewInput(value string) text.Editor {
+	var editor text.Editor
+	editor.Restrict(previewDigit, 7)
+	editor.Insert(value)
+	return editor
 }
 
 func normalizeTerminalScrollback(value int) int {
@@ -230,6 +327,36 @@ func closeActionFromString(value string) closeAction {
 	return closeToTray
 }
 
+// keepWindowsPolicy is what quitting the application does with the windows
+// that are open: keep their records for the next launch, discard them, or ask.
+type keepWindowsPolicy uint8
+
+const (
+	keepWindowsAlways keepWindowsPolicy = iota
+	keepWindowsNever
+	keepWindowsAsk
+)
+
+func (policy keepWindowsPolicy) String() string {
+	switch policy {
+	case keepWindowsNever:
+		return "never"
+	case keepWindowsAsk:
+		return "ask"
+	}
+	return "always"
+}
+
+func keepWindowsPolicyFromString(value string) keepWindowsPolicy {
+	switch value {
+	case keepWindowsNever.String():
+		return keepWindowsNever
+	case keepWindowsAsk.String():
+		return keepWindowsAsk
+	}
+	return keepWindowsAlways
+}
+
 type relaunchAction uint8
 
 const (
@@ -287,13 +414,20 @@ func (state *State) openSettings() {
 	if session, ok := state.sessionByIDPointer(state.activeSessionID); ok {
 		state.releaseIdleSFTP(session)
 	}
+	// Returning to an already-open settings tab preserves where the user left
+	// the page (scroll offsets, drawer, and visit state). Only opening settings
+	// anew starts back at the top.
+	reopen := !state.settingsTab
+	state.settingsTab = true
 	state.activeSection = sectionSettings
-	state.settingsScroll = 0
-	state.settings.navScroll = 0
 	state.settings.pageMotion, state.settings.navMotion = gfx.Motion{}, gfx.Motion{}
-	state.settings.aboutCopied = false
-	state.schemeBrowserOpen = false
-	state.revealSettingsCategory()
+	if reopen {
+		state.settingsScroll = 0
+		state.settings.navScroll = 0
+		state.settings.aboutCopied = false
+		state.schemeBrowserOpen = false
+		state.revealSettingsCategory()
+	}
 	state.aiSettingsOpened()
 	state.save()
 }
@@ -503,7 +637,9 @@ var (
 	settingsAppearanceChoices      = [...]appearanceMode{appearanceFollowSystem, appearancePinnedDark, appearancePinnedLight}
 	settingsToolbarPositionChoices = [...]terminalToolbarPosition{terminalToolbarLeft, terminalToolbarRight}
 	settingsTabOrientationChoices  = [...]tabOrientation{tabsHorizontal, tabsVertical}
+	settingsTabDoubleClickChoices  = [...]tabDoubleClickAction{tabDoubleClickRename, tabDoubleClickDuplicate, tabDoubleClickNone}
 	settingsCloseChoices           = [...]closeAction{closeToTray, closeQuits}
+	settingsKeepWindowsChoices     = [...]keepWindowsPolicy{keepWindowsAlways, keepWindowsNever, keepWindowsAsk}
 	settingsRelaunchChoices        = [...]relaunchAction{relaunchRaise, relaunchNewWindow}
 	settingsUpdateSourceChoices    = [...]update.Source{update.SourceOfficial, update.SourceCNB}
 )
@@ -550,11 +686,32 @@ func (state *State) settingsTabOrientationLabel(orientation tabOrientation) stri
 	return state.messages.SettingsTabsHorizontal
 }
 
+func (state *State) settingsTabDoubleClickLabel(action tabDoubleClickAction) string {
+	switch action {
+	case tabDoubleClickRename:
+		return state.messages.MenuRenameTab
+	case tabDoubleClickNone:
+		return state.messages.SettingsTabDoubleClickNone
+	}
+	return state.messages.MenuDuplicateTab
+}
+
 func (state *State) settingsCloseLabel(action closeAction) string {
 	if action == closeQuits {
 		return state.messages.Tools.GeneralCloseQuit
 	}
 	return state.messages.Tools.GeneralCloseTray
+}
+
+func (state *State) settingsKeepWindowsLabel(policy keepWindowsPolicy) string {
+	messages := state.messages.Tools
+	switch policy {
+	case keepWindowsNever:
+		return messages.GeneralKeepWindowsDiscard
+	case keepWindowsAsk:
+		return messages.GeneralKeepWindowsAsk
+	}
+	return messages.GeneralKeepWindowsKeep
 }
 
 func (state *State) settingsRelaunchLabel(action relaunchAction) string {
@@ -733,6 +890,24 @@ func (state *State) settingsNetworkProxyLabel(mode networkProxyMode) string {
 func (state *State) settingsKey(event gfx.KeyEvent) (gfx.EventResult, bool) {
 	if state.modal != modalNone || state.activeSection != sectionSettings {
 		return gfx.EventResult{}, false
+	}
+	// The preview stepper's field commits on Enter and on leaving the field;
+	// Escape puts the stored number back without changing it.
+	if state.settingsCategory == settingsFiles && state.filePreviewEdit.editing {
+		if event.Target != hitSettingsPreviewValue {
+			state.commitFilePreviewEdit()
+		} else {
+			switch event.Key {
+			case gfx.KeyEnter:
+				state.commitFilePreviewEdit()
+				return gfx.EventResult{Handled: true, Repaint: true}, true
+			case gfx.KeyEscape:
+				state.filePreviewEdit.editing = false
+				return gfx.EventResult{Handled: true, Repaint: true}, true
+			case gfx.KeyTab:
+				state.commitFilePreviewEdit()
+			}
+		}
 	}
 	if event.Target == hitSettingsLocalShell && localShellSettingVisible() && !state.localShellMenu.open && (event.Key == gfx.KeyDown || event.Key == gfx.KeyUp) {
 		state.refreshLocalShells()

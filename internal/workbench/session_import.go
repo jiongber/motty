@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/vivaui/viva/app"
 	"github.com/vivaui/viva/gfx"
@@ -15,11 +16,12 @@ import (
 )
 
 // Importing the saved sessions of PuTTY, Xshell, MobaXterm, WindTerm, Electerm,
-// Netcatty, SecureCRT and FinalShell. The files are read by
+// Netcatty, SecureCRT, FinalShell, Xterminal, XPipe and Tabby. The files are read by
 // internal/sessionimport; this file picks them, turns their sessions into hosts
 // and shows what came of it in the same result dialog as an OpenSSH config.
-// SecureCRT keeps its sessions as a tree of .ini files and FinalShell keeps
-// them in a data folder, so both ask for a folder instead of files.
+// SecureCRT keeps its sessions as a tree of .ini files, and FinalShell,
+// Xterminal and XPipe keep their data in a folder, so they ask for a folder
+// instead of files.
 
 // sessionImportHits is the place of the controls this file paints.
 var sessionImportHits = tree.Feature("session-import")
@@ -41,6 +43,9 @@ var (
 	hitImportNetcatty        = tree.ID(sessionImportHits, "import-netcatty")
 	hitImportSecureCRT       = tree.ID(sessionImportHits, "import-secure-crt")
 	hitImportFinalShell      = tree.ID(sessionImportHits, "import-final-shell")
+	hitImportXterminal       = tree.ID(sessionImportHits, "import-xterminal")
+	hitImportXPipe           = tree.ID(sessionImportHits, "import-xpipe")
+	hitImportTabby           = tree.ID(sessionImportHits, "import-tabby")
 	hitImportGuide           = tree.ID(sessionImportHits, "import-guide")
 	hitImportPreviewCancel   = tree.ID(sessionImportHits, "import-preview-cancel")
 	hitImportPreviewClose    = tree.ID(sessionImportHits, "import-preview-close")
@@ -54,11 +59,14 @@ type sessionImportPassword struct {
 }
 
 type sessionImportPreview struct {
-	plan      hostImportPlan
-	summary   string
-	passwords []sessionImportPassword
-	conflicts int
-	eligible  int
+	base       *configBase
+	plan       hostImportPlan
+	summary    string
+	passwords  []sessionImportPassword
+	conflicts  int
+	eligible   int
+	tabby      []sessionimport.Entry
+	tabbyVault bool
 }
 
 type mobaEncodingPrompt struct {
@@ -83,6 +91,12 @@ func importClientName(client sessionimport.Client) string {
 		return "SecureCRT"
 	case sessionimport.FinalShell:
 		return "FinalShell"
+	case sessionimport.Xterminal:
+		return "Xterminal"
+	case sessionimport.XPipe:
+		return "XPipe"
+	case sessionimport.Tabby:
+		return "Tabby"
 	}
 	return "MobaXterm"
 }
@@ -105,6 +119,12 @@ func (state *State) clickImportSessions(id gfx.ID) {
 		state.importSessions(sessionimport.SecureCRT)
 	case hitImportFinalShell:
 		state.importSessions(sessionimport.FinalShell)
+	case hitImportXterminal:
+		state.importSessions(sessionimport.Xterminal)
+	case hitImportXPipe:
+		state.importSessions(sessionimport.XPipe)
+	case hitImportTabby:
+		state.importTabby()
 	case hitImportGuide:
 		state.openExternal(state.messages.Tools.ImportGuideURL)
 	case hitImportSessionsCancel, hitImportSessionsClose, hitImportSessionsDismiss:
@@ -141,7 +161,8 @@ func (state *State) importSessionsWithOptions(client sessionimport.Client, optio
 // importClientUsesFolder reports whether a client keeps its sessions in a
 // folder whose inner layout becomes groups, so it is picked as a folder.
 func importClientUsesFolder(client sessionimport.Client) bool {
-	return client == sessionimport.SecureCRT || client == sessionimport.FinalShell
+	return client == sessionimport.SecureCRT || client == sessionimport.FinalShell ||
+		client == sessionimport.Xterminal || client == sessionimport.XPipe
 }
 
 // importSessionFolder asks for the folder that holds a client's sessions. Each
@@ -150,7 +171,7 @@ func (state *State) importSessionFolder(client sessionimport.Client, options ses
 	m := state.messages.Tools
 	name := importClientName(client)
 	title := fmt.Sprintf(m.ImportFolderPickerFmt, name)
-	if client == sessionimport.FinalShell {
+	if client == sessionimport.FinalShell || client == sessionimport.Xterminal || client == sessionimport.XPipe {
 		title = fmt.Sprintf(m.ImportConfigFolderPickerFmt, name)
 	}
 	folder, err := state.options.OpenDirectory(app.OpenDirectoryOptions{Title: title})
@@ -200,6 +221,11 @@ func (state *State) readSessionImport(client sessionimport.Client, paths []strin
 		state.showFileReadFailure(fmt.Sprintf(m.ImportPickerFmt, importClientName(client)), err, fallback)
 		return
 	}
+	state.prepareSessionImport(client, result, false)
+}
+
+func (state *State) prepareSessionImport(client sessionimport.Client, result sessionimport.Result, tabbyVault bool) {
+	m := state.messages.Tools
 	plan := state.sessionImportPlan(result)
 	if result.Keys > 0 {
 		plan.warnings = append(plan.warnings, fmt.Sprintf(m.ImportWarningKeysFmt, result.Keys))
@@ -213,7 +239,7 @@ func (state *State) readSessionImport(client sessionimport.Client, paths []strin
 	plan.warnings = append(plan.warnings, result.Warnings...)
 	if result.PlainSecrets > 0 {
 		plan.warnings = append(plan.warnings, fmt.Sprintf(m.ImportWarningCleartextFmt, result.PlainSecrets))
-	} else {
+	} else if client != sessionimport.Tabby {
 		plan.warnings = append(plan.warnings, m.ImportWarningPasswords)
 	}
 	summary := fmt.Sprintf(m.ImportSummaryFmt, len(plan.hosts), importClientName(client), plan.duplicateHosts)
@@ -221,8 +247,14 @@ func (state *State) readSessionImport(client sessionimport.Client, paths []strin
 	if conflicts > 0 {
 		plan.warnings = append(plan.warnings, fmt.Sprintf(m.ImportPasswordConflictFmt, conflicts))
 	}
-	if len(passwords) > 0 {
-		state.sessionImport = sessionImportPreview{plan: plan, summary: summary, passwords: passwords, conflicts: conflicts}
+	if tabbyVault || len(passwords) > 0 || client == sessionimport.Tabby && tabbyImportHasKeys(result.Entries) {
+		state.sessionImport = sessionImportPreview{
+			base: state.configBase, plan: plan, summary: summary, passwords: passwords, conflicts: conflicts,
+		}
+		if client == sessionimport.Tabby {
+			state.sessionImport.tabby = result.Entries
+			state.sessionImport.tabbyVault = tabbyVault
+		}
 		state.dialogError = ""
 		if changes, err := state.sessionImportPasswordChanges(); err != nil {
 			state.dialogError = state.hostPasswordSaveError(err)
@@ -232,7 +264,7 @@ func (state *State) readSessionImport(client sessionimport.Client, paths []strin
 		state.modal = modalSessionImportPreview
 		return
 	}
-	if err := state.stageSessionImport(plan); err != nil {
+	if err := state.stageSessionImport(plan, true); err != nil {
 		state.modal = modalNone
 		state.showActionWarning(m.ImportChooserTitle, fmt.Sprintf(m.ImportHostSaveFailedFmt, err))
 		return
@@ -248,18 +280,29 @@ func mobaEncodingSample(entry sessionimport.Entry) string {
 	return entry.Group + " / " + label + " · " + entry.User + "@" + entry.Host
 }
 
-func (state *State) stageSessionImport(plan hostImportPlan) error {
+func (state *State) stageSessionImport(plan hostImportPlan, notify bool) error {
+	oldHosts := state.hosts
 	oldHostCount, oldIdentityCount, oldProxyCount := len(state.hosts), len(state.identities), len(state.proxies)
 	oldHostID, oldIdentityID, oldProxyID := state.nextHostID, state.nextIdentityID, state.nextProxyID
+	if len(plan.hostUpdates) > 0 {
+		state.hosts = slices.Clone(state.hosts)
+		for index := range state.hosts {
+			if options, ok := plan.hostUpdates[state.hosts[index].ID]; ok {
+				state.hosts[index].SSHOptions = options
+			}
+		}
+	}
 	state.hosts = append(state.hosts, plan.hosts...)
 	state.identities = append(state.identities, plan.identities...)
 	state.proxies = append(state.proxies, plan.proxies...)
 	state.nextHostID, state.nextIdentityID, state.nextProxyID = plan.nextHostID, plan.nextIdentityID, plan.nextProxyID
 	state.refreshHostGroups()
-	if len(plan.hosts)+len(plan.identities)+len(plan.proxies) > 0 {
-		if err := state.saveWithResultMode(false); err != nil {
+	if len(plan.hosts)+len(plan.hostUpdates)+len(plan.identities)+len(plan.proxies) > 0 {
+		// The caller may hold the vault lock. A config conflict must return
+		// without re-entering the vault. Other windows reload after commit.
+		if err := state.saveWithResultModeRecovery(false, false, notify); err != nil {
 			clear(state.hosts[oldHostCount:])
-			state.hosts = state.hosts[:oldHostCount]
+			state.hosts = oldHosts
 			state.identities = state.identities[:oldIdentityCount]
 			state.proxies = state.proxies[:oldProxyCount]
 			state.nextHostID, state.nextIdentityID, state.nextProxyID = oldHostID, oldIdentityID, oldProxyID
@@ -281,7 +324,7 @@ func (state *State) completeSessionImport(plan hostImportPlan, summary string, p
 	state.status = summary
 	state.modal = modalHostImportResult
 	state.sshSyncFlush()
-	if len(plan.hosts)+passwordCount > 0 {
+	if len(plan.hosts)+len(plan.hostUpdates)+passwordCount > 0 {
 		state.scheduleSync()
 	}
 }
@@ -324,6 +367,9 @@ func (state *State) declareImportSessions(c ui.C) {
 		{hitImportNetcatty, "Netcatty"},
 		{hitImportSecureCRT, "SecureCRT"},
 		{hitImportFinalShell, "FinalShell"},
+		{hitImportXterminal, "Xterminal"},
+		{hitImportXPipe, "XPipe"},
+		{hitImportTabby, "Tabby"},
 	}
 	const columns = 2
 	gap := theme.Metrics.GapItem
@@ -423,8 +469,17 @@ func (state *State) declareSessionImportPreview(c ui.C) {
 	}
 	const width float32 = 550
 	description := fmt.Sprintf(m.ImportPasswordPreviewBodyFmt, len(state.sessionImport.plan.hosts), len(state.sessionImport.passwords), state.sessionImport.eligible)
+	title, saveLabel := m.ImportPasswordPreviewTitle, m.ImportSavePasswords
+	if state.sessionImport.tabby != nil {
+		title, saveLabel = m.TabbyImportTitle, m.TabbyImportSave
+		description = m.TabbyImportDescription
+	}
+	if state.sessionImport.tabbyVault {
+		saveLabel = m.TabbyVaultSave
+		description = fmt.Sprintf(m.TabbyVaultPreviewFmt, len(state.sessionImport.plan.hosts), state.sessionImport.eligible)
+	}
 	dialog := ui.Dialog(c, ui.DialogSpec{
-		Title: m.ImportPasswordPreviewTitle, Description: description,
+		Title: title, Description: description,
 		Width: width, Layer: dialogLayer,
 		Scope: dialogScope, DismissID: hitImportPreviewCancel, CloseID: hitImportPreviewClose,
 	})
@@ -442,7 +497,7 @@ func (state *State) declareSessionImportPreview(c ui.C) {
 		if ui.Button(c, m.ImportConnectionsOnly).Secondary().Shrink(0).AutoFocus().Clicked() {
 			c.After(func() { state.clickSessionImportPreview(hitImportConnectionsOnly) })
 		}
-		if ui.Button(c, m.ImportSavePasswords).Shrink(0).Clicked() {
+		if ui.Button(c, saveLabel).Shrink(0).Clicked() {
 			c.After(func() { state.clickSessionImportPreview(hitImportSavePasswords) })
 		}
 	})
@@ -452,15 +507,15 @@ func (state *State) declareSessionImportPreview(c ui.C) {
 }
 
 func (state *State) sessionImportPasswords(result sessionimport.Result, plan hostImportPlan) ([]sessionImportPassword, int) {
-	hosts := make(map[hostConnection]Host, len(state.hosts)+len(plan.hosts))
+	hosts := make(map[sessionImportHostKey]Host, len(state.hosts)+len(plan.hosts))
 	for _, host := range state.hosts {
 		if host.isSSH() {
-			hosts[connectionKey(host.Address, host.User, host.Port)] = host
+			hosts[sessionImportHostKeyFor(host)] = host
 		}
 	}
 	for _, host := range plan.hosts {
 		if host.isSSH() {
-			hosts[connectionKey(host.Address, host.User, host.Port)] = host
+			hosts[sessionImportHostKeyFor(host)] = host
 		}
 	}
 	byName := make(map[string]sessionImportPassword)
@@ -469,7 +524,9 @@ func (state *State) sessionImportPasswords(result sessionimport.Result, plan hos
 		if entry.Protocol != sessionimport.SSH || entry.Password == "" {
 			continue
 		}
-		host, ok := hosts[connectionKey(entry.Host, entry.User, uint16(entry.Port))]
+		host, ok := hosts[sessionImportHostKeyFor(Host{
+			Label: entry.Name, Address: entry.Host, User: entry.User, Port: uint16(entry.Port),
+		})]
 		if !ok {
 			continue
 		}
@@ -491,12 +548,35 @@ func (state *State) sessionImportPasswords(result sessionimport.Result, plan hos
 	return passwords, len(conflicted)
 }
 
+// sessionImportHostKey is the identity of an imported SSH host as the user sees
+// it: its name and destination. Two sessions at one address with different
+// names are different hosts, and each keeps its own password.
+type sessionImportHostKey struct {
+	label      string
+	connection hostConnection
+	terminal   hostTerminal
+	viaSSH     bool
+}
+
+func sessionImportHostKeyFor(host Host) sessionImportHostKey {
+	return sessionImportHostKey{
+		label:      strings.ToLower(strings.TrimSpace(host.Label)),
+		connection: connectionKey(host.Address, host.User, host.Port),
+		terminal:   host.Terminal,
+		viaSSH:     host.ViaSSH,
+	}
+}
+
 func (state *State) sessionImportPasswordChanges() ([]vault.Change, error) {
+	return state.missingSessionPasswords(state.sessionImport.passwords)
+}
+
+func (state *State) missingSessionPasswords(passwords []sessionImportPassword) ([]vault.Change, error) {
 	if state.secrets.vault == nil {
 		return nil, vault.ErrUnavailable
 	}
-	changes := make([]vault.Change, 0, len(state.sessionImport.passwords))
-	for _, candidate := range state.sessionImport.passwords {
+	changes := make([]vault.Change, 0, len(passwords))
+	for _, candidate := range passwords {
 		name, ok := hostPasswordSecretName(candidate.host)
 		if !ok {
 			continue
@@ -524,42 +604,66 @@ func (state *State) clickSessionImportPreview(id gfx.ID) {
 			return
 		}
 		pending := state.sessionImport
+		// Another window or sync may have reloaded the catalog while the
+		// dialog was open. Its runtime IDs and credential owners are now stale.
+		if pending.base != state.configBase {
+			state.dialogError = state.messages.Tools.ImportPreviewStale
+			return
+		}
 		plan := pending.plan
 		var changes []vault.Change
 		if id == hitImportSavePasswords {
 			var err error
 			changes, err = state.sessionImportPasswordChanges()
+			if err == nil && pending.tabby != nil {
+				var extra []vault.Change
+				extra, err = state.planTabbyKeys(pending.tabby, &plan)
+				changes = append(changes, extra...)
+			}
 			if err != nil {
 				state.dialogError = state.hostPasswordSaveError(err)
 				return
 			}
 		}
-		state.sessionImport = sessionImportPreview{}
-		state.dialogError = ""
-		commit := func(count int) error {
-			if id == hitImportSavePasswords {
-				plan.warnings = append(plan.warnings, fmt.Sprintf(state.messages.Tools.ImportPasswordsSavedFmt, count))
-			}
-			return state.stageSessionImport(plan)
-		}
-		var err error
-		applied := 0
-		if len(changes) > 0 {
-			applied, err = state.secrets.vault.ApplyMissingWithCommit(changes, commit)
-		} else {
-			err = commit(0)
-		}
-		if err != nil {
-			state.sessionImport = pending
-			state.modal = modalSessionImportPreview
-			state.dialogError = fmt.Sprintf(state.messages.Tools.ImportHostSaveFailedFmt, state.vaultErrorText(err))
-			if errors.Is(err, vault.ErrRollbackFailed) {
-				state.dialogError += " " + state.messages.Tools.ImportHostSaveRollbackFailed
-			}
-			return
-		}
-		state.completeSessionImport(plan, pending.summary, applied)
+		state.commitSessionImport(id, pending, plan, changes)
 	}
+}
+
+func (state *State) commitSessionImport(id gfx.ID, pending sessionImportPreview, plan hostImportPlan, changes []vault.Change) {
+	state.sessionImport = sessionImportPreview{}
+	state.dialogError = ""
+	before := state.lastSaved
+	commit := func(count int) error {
+		if id == hitImportSavePasswords {
+			saved := state.messages.Tools.ImportPasswordsSavedFmt
+			if pending.tabby != nil {
+				saved = state.messages.Tools.TabbyImportSavedFmt
+			}
+			plan.warnings = append(plan.warnings, fmt.Sprintf(saved, count))
+		}
+		return state.stageSessionImport(plan, false)
+	}
+	var err error
+	applied := 0
+	if len(changes) > 0 {
+		applied, err = state.secrets.vault.ApplyMissingWithCommit(changes, commit)
+	} else {
+		err = commit(0)
+	}
+	if err != nil {
+		state.sessionImport = pending
+		state.modal = modalSessionImportPreview
+		state.dialogError = fmt.Sprintf(state.messages.Tools.ImportHostSaveFailedFmt, state.vaultErrorText(err))
+		if errors.Is(err, vault.ErrRollbackFailed) {
+			state.dialogError += " " + state.messages.Tools.ImportHostSaveRollbackFailed
+		}
+		return
+	}
+	if pending.tabby != nil && applied > 0 {
+		state.reloadStoredIdentities()
+	}
+	state.configurationSaved(changedSavedFields(before, state.lastSaved), false, false)
+	state.completeSessionImport(plan, pending.summary, applied)
 }
 
 func (state *State) sessionImportPlan(result sessionimport.Result) hostImportPlan {
@@ -573,50 +677,75 @@ func (state *State) sessionImportPlan(result sessionimport.Result) hostImportPla
 		if port == 0 {
 			port = defaultPort
 		}
-		key := connectionKey(entry.Host, entry.User, port)
-		if _, exists := builder.connections[key]; exists {
-			builder.plan.duplicateHosts++
-			continue
-		}
 		host := Host{
 			ID: builder.plan.nextHostID, Label: entry.Name, Group: entry.Group,
 			Address: entry.Host, User: entry.User, Port: port,
+			LoginCommand: restoredLoginCommand(entry.Command),
+		}
+		if settings := entry.SSHSettings; settings != nil {
+			switch settings.Auth {
+			case "password", "keyboardInteractive":
+				host.Auth = authPassword
+			case "publicKey":
+				host.Auth = authPrivateKey
+			case "agent":
+				host.Auth = authAgent
+			}
+			if len(settings.IdentityFiles) > 0 {
+				host.SSHOptions = &sshconfig.ConnectionOptions{IdentityFiles: slices.Clone(settings.IdentityFiles)}
+			}
+		}
+		host.finish()
+		if state.hostIndexSameName(host) >= 0 || planHasSameHost(builder.plan, host) {
+			builder.plan.duplicateHosts++
+			builder.plan.warnings = append(builder.plan.warnings,
+				fmt.Sprintf(state.messages.Tools.ImportWarningSkippedHostFmt, host.Label, hostTarget(host)))
+			continue
 		}
 		host.CatalogID = freshCatalogID(builder.usedIDs)
-		host.finish()
 		builder.plan.nextHostID++
 		builder.plan.hosts = append(builder.plan.hosts, host)
-		builder.connections[key] = host
 	}
 	return builder.plan
+}
+
+// planHasSameHost reports whether the hosts this import has already made
+// include host. Sessions from another client are told apart by their name, so
+// two saved entries at one address both arrive; only the same name and address
+// is a repeat.
+func planHasSameHost(plan hostImportPlan, host Host) bool {
+	return slices.ContainsFunc(plan.hosts, func(planned Host) bool { return sameHost(planned, host) })
 }
 
 func (state *State) planStreamImport(plan *hostImportPlan, usedIDs map[string]struct{}, entry sessionimport.Entry) {
 	host := Host{
 		ID: plan.nextHostID, Label: entry.Name, Group: entry.Group,
-		Address: entry.Host, Port: uint16(entry.Port),
+		Address: entry.Host, Port: uint16(entry.Port), User: entry.User,
 	}
-	if entry.Protocol == sessionimport.Serial {
+	switch entry.Protocol {
+	case sessionimport.Serial:
 		if !host.applyTransport(savedTransport{Protocol: "serial", Line: entry.Line, Flow: entry.Flow}) {
 			plan.duplicateHosts++ // a line that cannot be used is left out
 			return
 		}
-	} else {
+	case sessionimport.Telnet:
+		host.Protocol = protocolTelnet
+	case sessionimport.VNC:
+		host.Protocol = protocolVNC
+	case sessionimport.RDP:
+		host.Protocol = protocolRDP
+	default:
 		host.Protocol = protocolTelnet
 	}
 	host.normalizeEndpoint()
-	host.CatalogID = freshCatalogID(usedIDs)
 	host.finish()
-	if state.hostIndexByEndpoint(host) >= 0 {
+	if state.hostIndexSameName(host) >= 0 || planHasSameHost(*plan, host) {
 		plan.duplicateHosts++
+		plan.warnings = append(plan.warnings,
+			fmt.Sprintf(state.messages.Tools.ImportWarningSkippedHostFmt, host.Label, hostTarget(host)))
 		return
 	}
-	for _, planned := range plan.hosts {
-		if sameEndpoint(planned, host) {
-			plan.duplicateHosts++
-			return
-		}
-	}
+	host.CatalogID = freshCatalogID(usedIDs)
 	plan.nextHostID++
 	plan.hosts = append(plan.hosts, host)
 }

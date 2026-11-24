@@ -201,11 +201,7 @@ func TestSendingFilesWhenTheOtherEndIsReadyToReceive(t *testing.T) {
 	shell.onWrite = func(p []byte) { receiver.Feed(p); shell.say(string(receiver.TakeOutput(nil))) }
 	receiver.Feed([]byte(zrqinit)) // the receiver wakes up and says ZRINIT
 	shell.say("waiting\r\n" + string(receiver.TakeOutput(nil)))
-	waitUntil(t, state, "the offer", func() bool { return state.modal == modalFileTransfer })
-	if !session.transfer.sending {
-		t.Fatal("a ZRINIT should offer to send")
-	}
-	state.Click(hitTransferChoose)
+	// Picking the files is the answer: no dialog comes first.
 	waitUntil(t, state, "the end", func() bool { return session.transfer.phase == transferNone })
 	if got := target.files["up.bin"]; got == nil || !bytes.Equal(got.Bytes(), payload) {
 		t.Fatalf("the receiver got %v", got)
@@ -294,16 +290,14 @@ func TestARepeatedSendOfferIsAnsweredOnce(t *testing.T) {
 		t.Fatal("the receiver did not ask for the file")
 	}
 	// The user decides slowly enough that the request is repeated.
-	shell.say("waiting\r\n" + string(ready) + string(ready))
-	waitUntil(t, state, "the offer", func() bool { return state.modal == modalFileTransfer })
-
 	var sent bytes.Buffer
 	shell.onWrite = func(p []byte) {
 		sent.Write(p)
 		remote.Feed(p)
 		shell.say(string(remote.TakeOutput(nil)))
 	}
-	state.Click(hitTransferChoose)
+	shell.say("waiting\r\n" + string(ready) + string(ready))
+	waitUntil(t, state, "the end", func() bool { return session.transfer.phase == transferNone })
 	if got := countFileHeaders(sent.Bytes()); got != 1 {
 		t.Fatalf("the receiver was told about %d files: %q", got, sent.Bytes())
 	}
@@ -363,13 +357,10 @@ func TestATransferFailsWhenTheShellWillNotTakeItsBytes(t *testing.T) {
 	remote := zmodem.NewReceiver(target)
 	shell.onWrite = func(p []byte) { remote.Feed(p); shell.say(string(remote.TakeOutput(nil))) }
 	remote.Feed([]byte(zrqinit))
-	shell.say("waiting\r\n" + string(remote.TakeOutput(nil)))
-	waitUntil(t, state, "the offer", func() bool { return state.modal == modalFileTransfer })
-
 	shell.mu.Lock()
 	shell.refuse = true
 	shell.mu.Unlock()
-	state.Click(hitTransferChoose)
+	shell.say("waiting\r\n" + string(remote.TakeOutput(nil)))
 	waitUntil(t, state, "the transfer to end", func() bool { return session.transfer.phase == transferNone })
 	if len(target.files) != 0 {
 		t.Fatalf("the receiver got %v", target.files)
@@ -525,5 +516,63 @@ func TestAnotherTabCanTransferWhileOneIsAlreadyRunning(t *testing.T) {
 	}
 	if !sawFirst || !sawSecond {
 		t.Fatalf("progress cards: first %v second %v", sawFirst, sawSecond)
+	}
+}
+
+// The shell closing mid-transfer still has the file's bytes buffered. Those
+// bytes are the transfer's, and drawing them rings the bell for every 0x07.
+func TestADisconnectedTransferDoesNotPaintItsBytes(t *testing.T) {
+	state, session, shell := transferState(t)
+	dir := t.TempDir()
+	state.options.OpenDirectory = func(app.OpenDirectoryOptions) (string, error) { return dir, nil }
+	state.options.Bell = func() error { return nil }
+	payload := make([]byte, 400000)
+	sender := zmodem.NewSender([]zmodem.SendFile{{Name: "big.bin", Size: int64(len(payload)), Source: bytes.NewReader(payload)}}, zmodem.SendOptions{Window: 2048})
+	answers := 0
+	shell.onWrite = func(p []byte) {
+		if answers < 3 {
+			answers++
+			sender.Feed(p)
+			shell.say(string(sender.TakeOutput(nil)))
+		}
+	}
+	shell.say(zrqinit)
+	waitUntil(t, state, "the offer", func() bool { return state.modal == modalFileTransfer })
+	state.Click(hitTransferChoose)
+	waitUntil(t, state, "the transfer to run", func() bool {
+		return session.transfer.phase == transferRunning && session.transfer.progress.Name == "big.bin"
+	})
+	shell.onWrite = nil
+	shell.say("\a\aLEAKED-BYTES")
+	state.closeDisconnectedShell(session)
+	if strings.Contains(screenText(state, 0), "LEAKED-BYTES") {
+		t.Fatalf("the transfer's bytes were drawn: %q", screenText(state, 0))
+	}
+	state.abandonTransfer(session)
+}
+
+// Picking files is the consent to send them, so an upload offer opens the
+// picker at once; cancelling it declines, and a picker that fails leaves the
+// dialog to show why.
+func TestAnUploadOfferOpensThePickerAndCancelDeclinesIt(t *testing.T) {
+	state, session, shell := transferState(t)
+	asked := 0
+	state.options.OpenFiles = func(app.OpenFileOptions) ([]string, error) { asked++; return nil, app.ErrCanceled }
+	shell.say("waiting\r\n" + zrinit)
+	waitUntil(t, state, "the offer to be declined", func() bool { return asked > 0 && session.transfer.phase == transferNone })
+	if state.modal == modalFileTransfer {
+		t.Fatal("an upload offer asked for confirmation before the picker")
+	}
+}
+
+func TestAnUploadOfferWhoseFilesCannotBeReadFallsBackToTheDialog(t *testing.T) {
+	state, session, shell := transferState(t)
+	state.options.OpenFiles = func(app.OpenFileOptions) ([]string, error) {
+		return []string{filepath.Join(t.TempDir(), "missing")}, nil
+	}
+	shell.say("waiting\r\n" + zrinit)
+	waitUntil(t, state, "the dialog", func() bool { return state.modal == modalFileTransfer })
+	if session.transfer.dialogError == "" || session.transfer.phase != transferOffered {
+		t.Fatalf("transfer = %+v", session.transfer)
 	}
 }

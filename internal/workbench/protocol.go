@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"motty/internal/charset"
+	"motty/internal/desktop"
 	"motty/internal/serial"
 	"motty/internal/sftpclient"
 	"motty/internal/sshconfig"
@@ -95,10 +96,15 @@ func (host Host) defaultPort() uint16 {
 	return defaultPort
 }
 
+// isDesktop reports whether the protocol carries a remote desktop.
+func (protocol hostProtocol) isDesktop() bool {
+	return protocol == protocolVNC || protocol == protocolRDP
+}
+
 // isDesktop reports whether the host is a remote desktop: its tab shows a
 // picture, not a terminal.
 func (host Host) isDesktop() bool {
-	return host.Protocol == protocolVNC || host.Protocol == protocolRDP
+	return host.Protocol.isDesktop()
 }
 
 // isRouteTarget reports whether a jump route can reach the host as its target:
@@ -140,6 +146,10 @@ type savedTransport struct {
 	// Proxy is nil when this host inherits the global outbound proxy. An entry
 	// whose kind is "direct" explicitly bypasses it.
 	Proxy *savedOutboundProxy `json:"proxy,omitempty"`
+	// ProxyProfile, when set, names a saved proxy profile that carries the host
+	// instead of Proxy, and ProxyBypass is the host's own direct list for it.
+	ProxyProfile string `json:"proxy_profile,omitempty"`
+	ProxyBypass  string `json:"proxy_bypass,omitempty"`
 	// Algorithms is "compatible" or "custom" for an SSH host that does not use
 	// the default algorithms; AlgorithmList is the custom list.
 	Algorithms    string `json:"algorithms,omitempty"`
@@ -167,8 +177,9 @@ type savedTransport struct {
 	InteractiveOnly bool `json:"interactive_only,omitempty"`
 	// NoHistory is set for an SSH host whose commands are not remembered.
 	NoHistory bool `json:"no_history,omitempty"`
-	// LoginCommand is the line an SSH host types into its shell after login.
-	LoginCommand string `json:"login_command,omitempty"`
+	// LoginCommand is the command lines an SSH host types into its shell after login.
+	LoginCommand       string `json:"login_command,omitempty"`
+	LoginCommandPolicy string `json:"login_command_policy,omitempty"`
 	// IdleKeepAliveSeconds is how often an idle terminal is sent input; zero is
 	// off. IdleInput is "cr", "nul" or "custom" (empty follows the protocol),
 	// and IdleInputCustom is the escaped text for "custom".
@@ -185,6 +196,8 @@ type savedTransport struct {
 	// console session instead of a new one, as mstsc /admin does. NoAudio is an
 	// RDP host's too: ask the server for no audio. StandardSecurity is an RDP
 	// host's as well: use Standard RDP Security alone, with no TLS or NLA.
+	// LegacyTLS is an RDP host's too: offer the RSA key exchange TLS suites
+	// that an old server requires.
 	// Chromeless is a desktop host's: its page shows the picture without the
 	// bars around it.
 	// The password is never here: it is asked for, and kept in the vault only if
@@ -194,11 +207,19 @@ type savedTransport struct {
 	Console          bool `json:"console,omitempty"`
 	NoAudio          bool `json:"no_audio,omitempty"`
 	StandardSecurity bool `json:"standard_security,omitempty"`
+	LegacyTLS        bool `json:"legacy_tls,omitempty"`
 	Chromeless       bool `json:"chromeless,omitempty"`
+	// ColorDepth, DesktopEncoding and Effects are a desktop host's quality
+	// choices. They are written only when they differ from what a host that never
+	// chose has, so an older record stays byte-for-byte what it was.
+	ColorDepth      int              `json:"color_depth,omitempty"`
+	DesktopEncoding desktop.Encoding `json:"desktop_encoding,omitempty"`
+	Effects         *desktop.Effects `json:"effects,omitempty"`
 }
 
 func (host Host) transport() savedTransport {
-	transport := savedTransport{Proxy: savedHostProxy(host.Proxy), Credential: host.Credential}
+	transport := savedTransport{Proxy: savedHostProxy(host.Proxy), Credential: host.Credential,
+		ProxyProfile: host.ProxyProfile, ProxyBypass: host.ProxyBypass}
 	// UTF-8 is the empty value, so a host that never chose a charset keeps its
 	// old record byte-for-byte.
 	if host.Encoding != "" && host.Encoding != charset.UTF8 {
@@ -219,12 +240,16 @@ func (host Host) transport() savedTransport {
 		return transport
 	case protocolVNC:
 		transport.Protocol, transport.ViaSSH, transport.Clipboard, transport.Chromeless = "vnc", host.ViaSSH, host.Clipboard, host.Chromeless
+		transport.ColorDepth, transport.DesktopEncoding = host.ColorDepth, host.PreferredEncoding
 		return transport
 	case protocolRDP:
 		transport.Protocol, transport.ViaSSH, transport.Clipboard, transport.Chromeless = "rdp", host.ViaSSH, host.Clipboard, host.Chromeless
 		transport.Console = host.Console
 		transport.NoAudio = host.NoAudio
 		transport.StandardSecurity = host.StandardSecurity
+		transport.LegacyTLS = host.LegacyTLS
+		transport.ColorDepth = host.ColorDepth
+		transport.Effects = host.Effects
 		return transport
 	case protocolSerial:
 		transport.Proxy, transport.Protocol, transport.Line = nil, "serial", host.Line.String()
@@ -247,6 +272,7 @@ func (host Host) transport() savedTransport {
 	transport.ForwardX11, transport.AgentForward, transport.NoHistory, transport.Transfer = host.ForwardX11, host.AgentForward, host.NoHistory, host.savedTransfer()
 	transport.InteractiveOnly = host.InteractiveOnly
 	transport.LoginCommand = host.LoginCommand
+	transport.LoginCommandPolicy = host.savedLoginCommandPolicy()
 	transport.RemoteLogPaths = host.RemoteLogPaths
 	return transport
 }
@@ -257,6 +283,13 @@ func (host Host) transport() savedTransport {
 func (host *Host) applyTransport(transport savedTransport) bool {
 	host.Proxy = restoredHostProxy(transport.Proxy)
 	host.Credential = strings.TrimSpace(transport.Credential)
+	host.ProxyProfile = strings.TrimSpace(transport.ProxyProfile)
+	host.ProxyBypass = strings.TrimSpace(transport.ProxyBypass)
+	if host.ProxyProfile != "" {
+		// A profile carries the route; a stale per-host proxy in the same
+		// record must not shadow it.
+		host.Proxy = nil
+	}
 	// An unknown charset is a damaged record: drop it rather than opening a
 	// session that would show replacement characters.
 	encoding, ok := charset.Normalize(strings.TrimSpace(transport.Encoding))
@@ -290,6 +323,7 @@ func (host *Host) applyTransport(transport savedTransport) bool {
 		host.InteractiveOnly = transport.InteractiveOnly
 		host.NoHistory = transport.NoHistory
 		host.LoginCommand = restoredLoginCommand(transport.LoginCommand)
+		host.applyLoginCommandPolicy(transport.LoginCommandPolicy)
 		host.RemoteLogPaths = restoreRemoteLogPaths(transport.RemoteLogPaths)
 		switch transport.Terminal {
 		case "", "ssh":
@@ -312,11 +346,18 @@ func (host *Host) applyTransport(transport savedTransport) bool {
 		host.Protocol, host.Credential = protocolTelnet, ""
 	case "vnc":
 		host.Protocol, host.ViaSSH, host.Clipboard, host.Chromeless = protocolVNC, transport.ViaSSH, transport.Clipboard, transport.Chromeless
+		host.ColorDepth, host.PreferredEncoding = vncColorDepth(transport.ColorDepth), transport.DesktopEncoding
+		if !host.PreferredEncoding.Valid() {
+			host.PreferredEncoding = desktop.EncodingAuto
+		}
 	case "rdp":
 		host.Protocol, host.ViaSSH, host.Clipboard, host.Chromeless = protocolRDP, transport.ViaSSH, transport.Clipboard, transport.Chromeless
 		host.Console = transport.Console
 		host.NoAudio = transport.NoAudio
 		host.StandardSecurity = transport.StandardSecurity
+		host.LegacyTLS = transport.LegacyTLS
+		host.ColorDepth = rdpColorDepth(transport.ColorDepth)
+		host.Effects = transport.Effects
 	case "serial":
 		host.Proxy, host.Credential = nil, ""
 		flow := serial.FlowNone
@@ -497,7 +538,7 @@ func (conn *streamConn) OpenShell(config sshconn.ShellConfig) (Shell, error) {
 	if shell == nil {
 		return nil, errors.New("workbench: the connection has no stream")
 	}
-	shell.Resize(config.Cols, config.Rows)
+	shell.Resize(config.Size())
 	return shell, nil
 }
 
@@ -605,10 +646,84 @@ func sameHost(a Host, b Host) bool {
 	return sameEndpoint(a, b) && strings.EqualFold(strings.TrimSpace(a.Label), strings.TrimSpace(b.Label))
 }
 
+// sameHostGroup reports whether two hosts are filed under one group. A host may
+// repeat a name and a destination in another group: the user keeps the same
+// server in two places on purpose, and the rows are told apart by the group they
+// sit in. A repeat inside one group is still the accidental duplicate the form
+// refuses.
+func sameHostGroup(a Host, b Host) bool {
+	return sameHostGroupPath(a, b.Group)
+}
+
+// sameHostGroupPath reports whether host is filed under group, as sameHostGroup
+// compares two hosts.
+func sameHostGroupPath(host Host, group string) bool {
+	return normalizeHostGroupPath(host.Group) == normalizeHostGroupPath(group)
+}
+
+// hostGroupTaken reports whether hosts already hold this destination under this
+// name in group, other than by the host itself. Moving a host there would make
+// the accidental duplicate the form refuses, and the fold that reconciles hosts
+// saved on two devices would drop one of the two on the next start.
+//
+// It reads the fold's own identity (mergeKeyOf, with the group swapped for the
+// one the host would land in) so the guard and the fold can never disagree about
+// which rows are the same host.
+func hostGroupTaken(hosts []Host, host Host, group string) bool {
+	want := mergeKeyInGroup(host, group)
+	for _, other := range hosts {
+		if other.ID != host.ID && mergeKeyOf(other) == want {
+			return true
+		}
+	}
+	return false
+}
+
+// mergeKeyInGroup is mergeKeyOf(host) with the group replaced: the identity the
+// fold would use for host once it is filed under group.
+func mergeKeyInGroup(host Host, group string) mergeKey {
+	host.Group = group
+	return mergeKeyOf(host)
+}
+
+// groupMoveRepeat reports the first moving host the fold would drop once the
+// moving hosts (given by their indexes in hosts) are all filed under group: one
+// that group already holds under the same identity, or one that repeats another
+// host moving with it. Hosts already in group change nothing and are left out of
+// moving by the caller.
+//
+// It keys hosts by mergeKeyOf, the fold's own identity, so the check is one
+// linear pass instead of a scan per host and a pairwise pass over the selection,
+// and it cannot drift from the fold as that key gains fields.
+func groupMoveRepeat(hosts []Host, moving []int, group string) (Host, bool) {
+	movingSet := make(map[uint32]bool, len(moving))
+	for _, index := range moving {
+		movingSet[hosts[index].ID] = true
+	}
+	seen := make(map[mergeKey]Host, len(hosts))
+	for _, host := range hosts {
+		key := mergeKeyOf(host)
+		if movingSet[host.ID] {
+			key = mergeKeyInGroup(host, group)
+		}
+		if other, ok := seen[key]; ok && other.ID != host.ID {
+			if movingSet[host.ID] {
+				return host, true
+			}
+			if movingSet[other.ID] {
+				return other, true
+			}
+		}
+		seen[key] = host
+	}
+	return Host{}, false
+}
+
 // hostIndexByEndpoint is where the list has a host that is the same destination
-// as host, or -1. It is what an import from another program is checked against:
-// an entry that is only a name for a server already saved is not worth a second
-// host, and a program's own names say little about it.
+// as host, or -1. The SSH config sync uses it to tell a block that only names a
+// server already saved from a host of its own. A session imported from another
+// client is identified by its name as well (see sameHost), because one bastion
+// address can hold several saved sessions.
 func (state *State) hostIndexByEndpoint(host Host) int {
 	for index, saved := range state.hosts {
 		if sameEndpoint(saved, host) {
@@ -618,8 +733,22 @@ func (state *State) hostIndexByEndpoint(host Host) int {
 	return -1
 }
 
-// hostIndexSame is where the list has the same host as host (see sameHost), or -1.
+// hostIndexSame is where the list has the same host as host (see sameHost), filed
+// under the group host is, or -1.
 func (state *State) hostIndexSame(host Host) int {
+	for index, saved := range state.hosts {
+		if sameHost(saved, host) && sameHostGroup(saved, host) {
+			return index
+		}
+	}
+	return -1
+}
+
+// hostIndexSameName is where the list already holds host's name at its
+// destination, whatever group that host is filed in, or -1. An import asks this
+// rather than hostIndexSame: a session the user already saved is not imported
+// again just because the file files it under another group.
+func (state *State) hostIndexSameName(host Host) int {
 	for index, saved := range state.hosts {
 		if sameHost(saved, host) {
 			return index
